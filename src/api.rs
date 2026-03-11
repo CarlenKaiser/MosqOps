@@ -62,11 +62,16 @@ pub async fn start_api_server(conf_path: String) {
         .route("/api/v1/groups/:group_name/roles/:role_name", axum::routing::delete(remove_group_role))
         .route("/api/v1/groups/:group_name/clients", post(add_client_to_group))
         .route("/api/v1/groups/:group_name/clients/:username", axum::routing::delete(remove_client_from_group))
+        .route("/api/v1/health", get(health_check))
         
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+pub async fn health_check() -> &'static str {
+    "OK"
 }
 
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<String, (StatusCode, String)> {
@@ -165,7 +170,7 @@ pub async fn create_client(
 
 pub async fn list_clients(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("listClients", json!({})).await {
         Ok(response) => {
             if let Some(clients) = response.data.get("clients").and_then(|c| c.as_array()) {
@@ -175,9 +180,9 @@ pub async fn list_clients(
                         else { c.get("username").and_then(|u| u.as_str()).map(|s| s.to_string()) }
                     })
                     .collect();
-                Ok(Json(json!({"clients": usernames.join("\n")})))
+                Ok(format!("Clients:\n{}", usernames.join("\n")))
             } else {
-                Ok(Json(json!({"clients": ""})))
+                Ok("Clients:\n".to_string())
             }
         },
         Err(e) => Err((StatusCode::BAD_REQUEST, format!("Failed to list clients: {}", e)))
@@ -187,9 +192,28 @@ pub async fn list_clients(
 pub async fn get_client(
     axum::extract::Path(username): axum::extract::Path<String>,
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("getClient", json!({"username": username})).await {
-        Ok(response) => Ok(Json(json!({"client": response.data}))),
+        Ok(response) => {
+            let mut result = format!("Username: {}\n", username);
+            if let Some(client_id) = response.data.get("clientid").and_then(|id| id.as_str()) {
+                result.push_str(&format!("Clientid: {}\n", client_id));
+            }
+            if let Some(roles) = response.data.get("roles").and_then(|r| r.as_array()) {
+                for role in roles {
+                    let role_name = role.get("rolename").and_then(|n| n.as_str()).unwrap_or("");
+                    let priority = role.get("priority").and_then(|p| p.as_i64()).unwrap_or(1);
+                    result.push_str(&format!("Roles: {} (priority: {})\n", role_name, priority));
+                }
+            }
+            if let Some(groups) = response.data.get("groups").and_then(|g| g.as_array()) {
+                let group_names: Vec<String> = groups.iter().filter_map(|g| g.get("groupname").and_then(|n| n.as_str()).map(|s| s.to_string())).collect();
+                if !group_names.is_empty() {
+                    result.push_str(&format!("Groups: {}\n", group_names.join(", ")));
+                }
+            }
+            Ok(result)
+        },
         Err(e) => Err((StatusCode::NOT_FOUND, format!("Client not found: {}", e)))
     }
 }
@@ -280,7 +304,7 @@ pub async fn create_role(
 
 pub async fn list_roles(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("listRoles", json!({})).await {
         Ok(response) => {
             if let Some(roles) = response.data.get("roles").and_then(|r| r.as_array()) {
@@ -290,9 +314,9 @@ pub async fn list_roles(
                         else { r.get("rolename").and_then(|u| u.as_str()).map(|s| s.to_string()) }
                     })
                     .collect();
-                Ok(Json(json!({"roles": rolenames.join("\n")})))
+                Ok(format!("Roles:\n{}", rolenames.join("\n")))
             } else {
-                Ok(Json(json!({"roles": ""})))
+                Ok("Roles:\n".to_string())
             }
         },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
@@ -302,9 +326,29 @@ pub async fn list_roles(
 pub async fn get_role(
     axum::extract::Path(role_name): axum::extract::Path<String>,
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("getRole", json!({"rolename": role_name})).await {
-        Ok(response) => Ok(Json(json!({"role": role_name, "acls": response.data.get("acls").unwrap_or(&json!([]))}))),
+        Ok(response) => {
+            let mut result = format!("Role: {}\n", role_name);
+            if let Some(acls) = response.data.get("acls").and_then(|a| a.as_array()) {
+                if !acls.is_empty() {
+                    result.push_str("ACLs:\n");
+                    for acl in acls {
+                        let acl_type = acl.get("acltype").and_then(|t| t.as_str()).unwrap_or("");
+                        let allow = acl.get("allow").and_then(|a| a.as_bool()).unwrap_or(true);
+                        let perm = if allow { "allow" } else { "deny" };
+                        let topic = acl.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+                        let priority = acl.get("priority").and_then(|p| p.as_i64()).unwrap_or(0);
+                        if priority > 0 {
+                            result.push_str(&format!("{}: {}: {} (priority: {})\n", acl_type, perm, topic, priority));
+                        } else {
+                            result.push_str(&format!("{}: {}: {}\n", acl_type, perm, topic));
+                        }
+                    }
+                }
+            }
+            Ok(result)
+        },
         Err(e) => Err((StatusCode::NOT_FOUND, format!("Role not found: {}", e)))
     }
 }
@@ -386,7 +430,7 @@ pub async fn create_group(
 
 pub async fn list_groups(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("listGroups", json!({})).await {
         Ok(response) => {
             if let Some(groups) = response.data.get("groups").and_then(|g| g.as_array()) {
@@ -396,9 +440,9 @@ pub async fn list_groups(
                         else { g.get("groupname").and_then(|u| u.as_str()).map(|s| s.to_string()) }
                     })
                     .collect();
-                Ok(Json(json!({"groups": groupnames.join("\n")})))
+                Ok(format!("Groups:\n{}", groupnames.join("\n")))
             } else {
-                Ok(Json(json!({"groups": ""})))
+                Ok("Groups:\n".to_string())
             }
         },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
@@ -408,17 +452,23 @@ pub async fn list_groups(
 pub async fn get_group(
     axum::extract::Path(group_name): axum::extract::Path<String>,
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("getGroup", json!({"groupname": group_name})).await {
         Ok(response) => {
-            // BunkerM expects { "group": { "name": ..., "roles": [...], "clients": [...] } }
-            // DynSec natively responds with `data` containing `groupname`, `roles`, `clients`.
-            let mut group_info = serde_json::Map::new();
-            group_info.insert("name".to_string(), response.data.get("groupname").unwrap_or(&json!("")).clone());
-            group_info.insert("roles".to_string(), response.data.get("roles").unwrap_or(&json!([])).clone());
-            group_info.insert("clients".to_string(), response.data.get("clients").unwrap_or(&json!([])).clone());
-            
-            Ok(Json(json!({"group": group_info})))
+            let mut result = format!("Group: {}\n", group_name);
+            if let Some(roles) = response.data.get("roles").and_then(|r| r.as_array()) {
+                for role in roles {
+                    let role_name = role.get("rolename").and_then(|n| n.as_str()).unwrap_or("");
+                    result.push_str(&format!("Roles: {}\n", role_name));
+                }
+            }
+            if let Some(clients) = response.data.get("clients").and_then(|c| c.as_array()) {
+                for client in clients {
+                    let client_name = client.get("username").and_then(|n| n.as_str()).unwrap_or("");
+                    result.push_str(&format!("Clients: {}\n", client_name));
+                }
+            }
+            Ok(result)
         },
         Err(e) => Err((StatusCode::NOT_FOUND, format!("Group not found: {}", e)))
     }
