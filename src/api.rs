@@ -168,11 +168,12 @@ pub async fn list_clients(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.dynsec.execute_command("listClients", json!({})).await {
         Ok(response) => {
-            crate::log_info(&format!("mosqops: listClients raw data: {}", response.data));
             if let Some(clients) = response.data.get("clients").and_then(|c| c.as_array()) {
                 let usernames: Vec<String> = clients.iter()
-                    .filter_map(|c| c.get("username").and_then(|u| u.as_str()))
-                    .map(|s| s.to_string())
+                    .filter_map(|c| {
+                        if let Some(u) = c.as_str() { Some(u.to_string()) }
+                        else { c.get("username").and_then(|u| u.as_str()).map(|s| s.to_string()) }
+                    })
                     .collect();
                 Ok(Json(json!({"clients": usernames.join("\n")})))
             } else {
@@ -282,11 +283,12 @@ pub async fn list_roles(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.dynsec.execute_command("listRoles", json!({})).await {
         Ok(response) => {
-            crate::log_info(&format!("mosqops: listRoles raw data: {}", response.data));
             if let Some(roles) = response.data.get("roles").and_then(|r| r.as_array()) {
                 let rolenames: Vec<String> = roles.iter()
-                    .filter_map(|r| r.get("rolename").and_then(|u| u.as_str()))
-                    .map(|s| s.to_string())
+                    .filter_map(|r| {
+                        if let Some(n) = r.as_str() { Some(n.to_string()) }
+                        else { r.get("rolename").and_then(|u| u.as_str()).map(|s| s.to_string()) }
+                    })
                     .collect();
                 Ok(Json(json!({"roles": rolenames.join("\n")})))
             } else {
@@ -387,11 +389,12 @@ pub async fn list_groups(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.dynsec.execute_command("listGroups", json!({})).await {
         Ok(response) => {
-            crate::log_info(&format!("mosqops: listGroups raw data: {}", response.data));
             if let Some(groups) = response.data.get("groups").and_then(|g| g.as_array()) {
                 let groupnames: Vec<String> = groups.iter()
-                    .filter_map(|g| g.get("groupname").and_then(|u| u.as_str()))
-                    .map(|s| s.to_string())
+                    .filter_map(|g| {
+                        if let Some(n) = g.as_str() { Some(n.to_string()) }
+                        else { g.get("groupname").and_then(|u| u.as_str()).map(|s| s.to_string()) }
+                    })
                     .collect();
                 Ok(Json(json!({"groups": groupnames.join("\n")})))
             } else {
