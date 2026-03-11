@@ -168,7 +168,7 @@ pub async fn list_clients(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.dynsec.execute_command("listClients", json!({})).await {
         Ok(response) => {
-            if let Some(clients) = response.data.get("data").and_then(|d| d.get("clients")).and_then(|c| c.as_array()) {
+            if let Some(clients) = response.data.get("clients").and_then(|c| c.as_array()) {
                 let usernames: Vec<String> = clients.iter()
                     .filter_map(|c| c.get("username").and_then(|u| u.as_str()))
                     .map(|s| s.to_string())
