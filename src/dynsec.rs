@@ -27,6 +27,7 @@ pub struct DynSecResponseItem {
     #[serde(rename = "correlationData")]
     pub correlation_data: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
     pub data: serde_json::Value,
 }
 

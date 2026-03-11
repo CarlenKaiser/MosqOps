@@ -20,10 +20,12 @@ pub struct ConfigUpdateRequest {
 
 use crate::dynsec::DynSecCoordinator;
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct ApiState {
     pub conf_path: String,
     pub dynsec: Arc<DynSecCoordinator>,
+    pub pending_restart: Arc<AtomicBool>,
 }
 
 pub async fn start_api_server(conf_path: String) {
@@ -37,16 +39,32 @@ pub async fn start_api_server(conf_path: String) {
         }
     };
 
+    // Create known-good "working" backups upon successful boot
+    if let Err(e) = std::fs::copy(&conf_path, format!("{}.working", conf_path)) {
+        crate::log_error(&format!("mosqops: Warning - Could not create safe backup of {}: {}", conf_path, e));
+    }
+    
+    let dynsec_path = "/data/mosquitto/dynamic-security.json";
+    if std::path::Path::new(dynsec_path).exists() {
+        if let Err(e) = std::fs::copy(dynsec_path, format!("{}.working", dynsec_path)) {
+            crate::log_error(&format!("mosqops: Warning - Could not create safe backup of dynsec config: {}", e));
+        }
+    }
+
     let state = Arc::new(ApiState { 
         conf_path,
-        dynsec: dynsec_client 
+        dynsec: dynsec_client,
+        pending_restart: Arc::new(AtomicBool::new(false)),
     });
 
     let app = Router::new()
+        .route("/api/status", get(get_system_status))
         .route("/api/config", get(get_config).post(update_config))
+        .route("/api/config/reset", post(reset_config))
         .route("/api/restart", post(trigger_restart))
         .route("/api/v1/clients", post(create_client).get(list_clients))
         .route("/api/v1/clients/:username", get(get_client).delete(remove_client))
+        .route("/api/v1/clients/:username/password", axum::routing::put(set_client_password))
         .route("/api/v1/clients/:username/enable", axum::routing::put(enable_client))
         .route("/api/v1/clients/:username/disable", axum::routing::put(disable_client))
         .route("/api/v1/clients/:username/roles", post(add_client_role))
@@ -59,6 +77,8 @@ pub async fn start_api_server(conf_path: String) {
         .route("/api/v1/groups", post(create_group).get(list_groups))
         .route("/api/v1/groups/:group_name", get(get_group).delete(delete_group))
         .route("/api/v1/groups/:group_name/roles", post(add_group_role))
+        .route("/api/v1/config/dynsec", get(get_dynsec_config).put(update_dynsec_config))
+        .route("/api/v1/config/dynsec/reset", post(reset_dynsec_config))
         .route("/api/v1/groups/:group_name/roles/:role_name", axum::routing::delete(remove_group_role))
         .route("/api/v1/groups/:group_name/clients", post(add_client_to_group))
         .route("/api/v1/groups/:group_name/clients/:username", axum::routing::delete(remove_client_from_group))
@@ -72,6 +92,17 @@ pub async fn start_api_server(conf_path: String) {
 
 pub async fn health_check() -> &'static str {
     "OK"
+}
+
+#[derive(serde::Serialize)]
+pub struct SystemStatus {
+    pub pending_restart: bool,
+}
+
+async fn get_system_status(State(state): State<Arc<ApiState>>) -> Json<SystemStatus> {
+    Json(SystemStatus {
+        pending_restart: state.pending_restart.load(Ordering::Relaxed),
+    })
 }
 
 async fn get_config(State(state): State<Arc<ApiState>>) -> Result<String, (StatusCode, String)> {
@@ -93,16 +124,88 @@ async fn update_config(
 ) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
     crate::log_info(&format!("mosqops: Updating config at {}", state.conf_path));
     
-    match std::fs::write(&state.conf_path, &payload.config_content) {
-        Ok(_) => Ok(Json(ConfigResponse {
-            message: "Configuration successfully updated.".into(),
-            status: "ok".into(),
-        })),
+    // 1. Write the new configuration to a temporary file
+    let tmp_path = format!("{}.test", state.conf_path);
+    if let Err(e) = std::fs::write(&tmp_path, &payload.config_content) {
+        crate::log_error(&format!("mosqops: Failed to write temp config: {}", e));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write temporary config file: {}", e),
+        ));
+    }
+    
+    // 2. Validate the syntax of the temporary file using Mosquitto's built-in test flag
+    crate::log_info("mosqops: Running pre-flight validation on new mosquitto configuration...");
+    let output = std::process::Command::new("mosquitto")
+        .arg("-c").arg(&tmp_path)
+        .arg("-v").arg("-test")
+        .output();
+        
+    match output {
+        Ok(out) => {
+            if !out.status.success() {
+                // Formatting the standard error (or stdout) from Mosquitto to return directly to the user
+                let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
+                let out_msg = String::from_utf8_lossy(&out.stdout).to_string();
+                crate::log_error(&format!("mosqops: Config validation failed. stderr: {}, stdout: {}", err_msg, out_msg));
+                
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid configuration syntax:\n{}", if !err_msg.is_empty() { err_msg } else { out_msg }),
+                ));
+            }
+        },
         Err(e) => {
-            crate::log_error(&format!("mosqops: Failed to write config: {}", e));
+            crate::log_error(&format!("mosqops: Failed to execute mosquitto validation: {}", e));
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to execute mosquitto validation command: {}", e),
+            ));
+        }
+    }
+
+    // 3. Validation passed, move the temporary file over the active configuration
+    match std::fs::rename(&tmp_path, &state.conf_path) {
+        Ok(_) => {
+            state.pending_restart.store(true, Ordering::Relaxed);
+            Ok(Json(ConfigResponse {
+                message: "Configuration successfully validated and updated.".into(),
+                status: "ok".into(),
+            }))
+        },
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Failed to commit valid config: {}", e));
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to write config file: {}", e),
+                format!("Failed to commit config file: {}", e),
+            ))
+        }
+    }
+}
+
+async fn reset_config(State(state): State<Arc<ApiState>>) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
+    crate::log_info(&format!("mosqops: Resetting config at {} from safe backup", state.conf_path));
+    
+    let working_path = format!("{}.working", state.conf_path);
+    if !std::path::Path::new(&working_path).exists() {
+        return Err((StatusCode::BAD_REQUEST, "No safe working backup found to restore.".into()));
+    }
+    
+    match std::fs::copy(&working_path, &state.conf_path) {
+        Ok(_) => {
+            state.pending_restart.store(false, Ordering::Relaxed);
+            Ok(Json(ConfigResponse {
+                message: "Configuration successfully restored to the last known working state.".into(),
+                status: "ok".into(),
+            }))
+        },
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Failed to restore config backup: {}", e));
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to restore config file: {}", e),
             ))
         }
     }
@@ -121,6 +224,95 @@ async fn trigger_restart() -> Json<ConfigResponse> {
         message: "Restart triggered. Broker is terminating.".into(),
         status: "ok".into(),
     })
+}
+
+// ----------------------------------------------------------------------------
+// Dynamic Security JSON Endpoints
+// ----------------------------------------------------------------------------
+
+pub async fn get_dynsec_config() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let path = "/data/mosquitto/dynamic-security.json";
+    crate::log_info(&format!("mosqops: Reading dynsec config from {}", path));
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            match serde_json::from_str(&content) {
+                Ok(json) => Ok(Json(json)),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse JSON: {}", e)))
+            }
+        },
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Failed to read dynsec config: {}", e));
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read dynsec config file: {}", e),
+            ))
+        }
+    }
+}
+
+pub async fn update_dynsec_config(
+    State(state): State<Arc<ApiState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
+    let path = "/data/mosquitto/dynamic-security.json";
+    crate::log_info(&format!("mosqops: Updating dynsec config at {}", path));
+    
+    let content = match serde_json::to_string_pretty(&payload) {
+        Ok(c) => c,
+        Err(e) => return Err((StatusCode::BAD_REQUEST, format!("Invalid JSON payload: {}", e)))
+    };
+    
+    match std::fs::write(path, content) {
+        Ok(_) => {
+            // DynSec needs to be reloaded after file modification
+            crate::log_info("mosqops: Reloading Mosquitto config to apply dynsec changes");
+            let _ = std::process::Command::new("kill").arg("-HUP").arg("1").status();
+            
+            state.pending_restart.store(true, Ordering::Relaxed);
+            
+            Ok(Json(ConfigResponse {
+                message: "Dynamic security configuration successfully updated and loaded.".into(),
+                status: "ok".into(),
+            }))
+        },
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Failed to write dynsec config: {}", e));
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to write dynsec config file: {}", e),
+            ))
+        }
+    }
+}
+
+pub async fn reset_dynsec_config(State(state): State<Arc<ApiState>>) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
+    let path = "/data/mosquitto/dynamic-security.json";
+    crate::log_info(&format!("mosqops: Resetting dynsec config at {} from safe backup", path));
+    
+    let working_path = format!("{}.working", path);
+    if !std::path::Path::new(&working_path).exists() {
+        return Err((StatusCode::BAD_REQUEST, "No safe working backup found to restore.".into()));
+    }
+    
+    match std::fs::copy(&working_path, path) {
+        Ok(_) => {
+            crate::log_info("mosqops: Reloading Mosquitto config to apply restored dynsec changes");
+            let _ = std::process::Command::new("kill").arg("-HUP").arg("1").status();
+            
+            state.pending_restart.store(false, Ordering::Relaxed);
+            Ok(Json(ConfigResponse {
+                message: "Dynamic security configuration successfully restored to the last known working state.".into(),
+                status: "ok".into(),
+            }))
+        },
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Failed to restore dynsec config backup: {}", e));
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to restore dynsec config file: {}", e),
+            ))
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -168,6 +360,33 @@ pub async fn create_client(
     }
 }
 
+pub async fn set_client_password(
+    axum::extract::Path(username): axum::extract::Path<String>,
+    State(state): State<Arc<ApiState>>,
+    Json(payload): Json<ClientCreate>,
+) -> Result<Json<ClientResponse>, (StatusCode, String)> {
+    let set_args = json!({
+        "username": username,
+        "password": payload.password,
+    });
+    
+    match state.dynsec.execute_command("setClientPassword", set_args).await {
+        Ok(_) => {
+            Ok(Json(ClientResponse {
+                username,
+                message: "Password set successfully".into(),
+                success: true,
+            }))
+        },
+        Err(e) => {
+            Err((
+                StatusCode::BAD_REQUEST,
+                format!("Error setting password: {}", e),
+            ))
+        }
+    }
+}
+
 pub async fn list_clients(
     State(state): State<Arc<ApiState>>,
 ) -> Result<String, (StatusCode, String)> {
@@ -195,18 +414,20 @@ pub async fn get_client(
 ) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("getClient", json!({"username": username})).await {
         Ok(response) => {
+            // DynSec nests client info under response.data.client
+            let client_data = response.data.get("client").unwrap_or(&response.data);
             let mut result = format!("Username: {}\n", username);
-            if let Some(client_id) = response.data.get("clientid").and_then(|id| id.as_str()) {
+            if let Some(client_id) = client_data.get("clientid").and_then(|id| id.as_str()) {
                 result.push_str(&format!("Clientid: {}\n", client_id));
             }
-            if let Some(roles) = response.data.get("roles").and_then(|r| r.as_array()) {
+            if let Some(roles) = client_data.get("roles").and_then(|r| r.as_array()) {
                 for role in roles {
                     let role_name = role.get("rolename").and_then(|n| n.as_str()).unwrap_or("");
                     let priority = role.get("priority").and_then(|p| p.as_i64()).unwrap_or(1);
                     result.push_str(&format!("Roles: {} (priority: {})\n", role_name, priority));
                 }
             }
-            if let Some(groups) = response.data.get("groups").and_then(|g| g.as_array()) {
+            if let Some(groups) = client_data.get("groups").and_then(|g| g.as_array()) {
                 let group_names: Vec<String> = groups.iter().filter_map(|g| g.get("groupname").and_then(|n| n.as_str()).map(|s| s.to_string())).collect();
                 if !group_names.is_empty() {
                     result.push_str(&format!("Groups: {}\n", group_names.join(", ")));
@@ -329,8 +550,10 @@ pub async fn get_role(
 ) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("getRole", json!({"rolename": role_name})).await {
         Ok(response) => {
+            // DynSec nests role info under response.data.role
+            let role_data = response.data.get("role").unwrap_or(&response.data);
             let mut result = format!("Role: {}\n", role_name);
-            if let Some(acls) = response.data.get("acls").and_then(|a| a.as_array()) {
+            if let Some(acls) = role_data.get("acls").and_then(|a| a.as_array()) {
                 if !acls.is_empty() {
                     result.push_str("ACLs:\n");
                     for acl in acls {
@@ -455,14 +678,16 @@ pub async fn get_group(
 ) -> Result<String, (StatusCode, String)> {
     match state.dynsec.execute_command("getGroup", json!({"groupname": group_name})).await {
         Ok(response) => {
+            // DynSec nests group info under response.data.group
+            let group_data = response.data.get("group").unwrap_or(&response.data);
             let mut result = format!("Group: {}\n", group_name);
-            if let Some(roles) = response.data.get("roles").and_then(|r| r.as_array()) {
+            if let Some(roles) = group_data.get("roles").and_then(|r| r.as_array()) {
                 for role in roles {
                     let role_name = role.get("rolename").and_then(|n| n.as_str()).unwrap_or("");
                     result.push_str(&format!("Roles: {}\n", role_name));
                 }
             }
-            if let Some(clients) = response.data.get("clients").and_then(|c| c.as_array()) {
+            if let Some(clients) = group_data.get("clients").and_then(|c| c.as_array()) {
                 for client in clients {
                     let client_name = client.get("username").and_then(|n| n.as_str()).unwrap_or("");
                     result.push_str(&format!("Clients: {}\n", client_name));
