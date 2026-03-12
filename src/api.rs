@@ -19,17 +19,50 @@ pub struct ConfigUpdateRequest {
 }
 
 use crate::dynsec::DynSecCoordinator;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
+use pbkdf2::pbkdf2;
+use hmac::Hmac;
+use sha2::Sha512;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use std::fs;
+use std::io;
 
 pub struct ApiState {
     pub conf_path: String,
+    pub dynsec_path: String,
     pub dynsec: Arc<DynSecCoordinator>,
     pub pending_restart: Arc<AtomicBool>,
+    pub dynsec_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-pub async fn start_api_server(conf_path: String) {
-    crate::log_info(&format!("mosqops: Starting Axum server on port 8080, conf_path: {}", conf_path));
+fn get_dynsec_path(conf_path: &str, opt_path: &str) -> String {
+    // 1. Environment variable takes highest precedence
+    if let Ok(env_path) = std::env::var("DYNSEC_PATH") {
+        return env_path;
+    }
+
+    // 2. Try to parse the actual mosquitto.conf to see what the dynsec plugin is using
+    if let Ok(content) = std::fs::read_to_string(conf_path) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("plugin_opt_config_file") {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let path = parts[1].to_string();
+                    crate::log_info(&format!("mosqops: Sourced dynsec path from {}: {}", conf_path, path));
+                    return path;
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to the option passed directly to this plugin
+    opt_path.to_string()
+}
+
+pub async fn start_api_server(conf_path: String, dynsec_path: String) {
+    crate::log_info(&format!("mosqops: Starting Axum server on port 8080, conf_path: {}, dynsec_path: {}", conf_path, dynsec_path));
 
     let dynsec_client = match DynSecCoordinator::new().await {
         Ok(c) => Arc::new(c),
@@ -44,17 +77,20 @@ pub async fn start_api_server(conf_path: String) {
         crate::log_error(&format!("mosqops: Warning - Could not create safe backup of {}: {}", conf_path, e));
     }
     
-    let dynsec_path = "/var/lib/mosquitto/dynamic-security.json";
-    if std::path::Path::new(dynsec_path).exists() {
-        if let Err(e) = std::fs::copy(dynsec_path, format!("{}.working", dynsec_path)) {
+    let actual_dynsec_path = get_dynsec_path(&conf_path, &dynsec_path);
+    crate::log_info(&format!("mosqops: Initializing with dynsec path: {}", actual_dynsec_path));
+    if std::path::Path::new(&actual_dynsec_path).exists() {
+        if let Err(e) = std::fs::copy(&actual_dynsec_path, format!("{}.working", actual_dynsec_path)) {
             crate::log_error(&format!("mosqops: Warning - Could not create safe backup of dynsec config: {}", e));
         }
     }
 
     let state = Arc::new(ApiState { 
         conf_path,
+        dynsec_path: actual_dynsec_path,
         dynsec: dynsec_client,
         pending_restart: Arc::new(AtomicBool::new(false)),
+        dynsec_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     let app = Router::new()
@@ -63,25 +99,25 @@ pub async fn start_api_server(conf_path: String) {
         .route("/api/config/reset", post(reset_config))
         .route("/api/restart", post(trigger_restart))
         .route("/api/v1/clients", post(create_client).get(list_clients))
-        .route("/api/v1/clients/:username", get(get_client).delete(remove_client))
-        .route("/api/v1/clients/:username/password", axum::routing::put(set_client_password))
-        .route("/api/v1/clients/:username/enable", axum::routing::put(enable_client))
-        .route("/api/v1/clients/:username/disable", axum::routing::put(disable_client))
-        .route("/api/v1/clients/:username/roles", post(add_client_role))
-        .route("/api/v1/clients/:username/roles/:role_name", axum::routing::delete(remove_client_role))
+        .route("/api/v1/clients/{username}", get(get_client).delete(remove_client))
+        .route("/api/v1/clients/{username}/password", axum::routing::put(set_client_password))
+        .route("/api/v1/clients/{username}/enable", axum::routing::put(enable_client))
+        .route("/api/v1/clients/{username}/disable", axum::routing::put(disable_client))
+        .route("/api/v1/clients/{username}/roles", post(add_client_role))
+        .route("/api/v1/clients/{username}/roles/{role_name}", axum::routing::delete(remove_client_role))
         
         .route("/api/v1/roles", post(create_role).get(list_roles))
-        .route("/api/v1/roles/:role_name", get(get_role).delete(delete_role))
-        .route("/api/v1/roles/:role_name/acls", post(add_role_acl).delete(remove_role_acl))
+        .route("/api/v1/roles/{role_name}", get(get_role).delete(delete_role))
+        .route("/api/v1/roles/{role_name}/acls", post(add_role_acl).delete(remove_role_acl))
         
         .route("/api/v1/groups", post(create_group).get(list_groups))
-        .route("/api/v1/groups/:group_name", get(get_group).delete(delete_group))
-        .route("/api/v1/groups/:group_name/roles", post(add_group_role))
+        .route("/api/v1/groups/{group_name}", get(get_group).delete(delete_group))
+        .route("/api/v1/groups/{group_name}/roles", post(add_group_role))
         .route("/api/v1/config/dynsec", get(get_dynsec_config).put(update_dynsec_config))
         .route("/api/v1/config/dynsec/reset", post(reset_dynsec_config))
-        .route("/api/v1/groups/:group_name/roles/:role_name", axum::routing::delete(remove_group_role))
-        .route("/api/v1/groups/:group_name/clients", post(add_client_to_group))
-        .route("/api/v1/groups/:group_name/clients/:username", axum::routing::delete(remove_client_from_group))
+        .route("/api/v1/groups/{group_name}/roles/{role_name}", axum::routing::delete(remove_group_role))
+        .route("/api/v1/groups/{group_name}/clients", post(add_client_to_group))
+        .route("/api/v1/groups/{group_name}/clients/{username}", axum::routing::delete(remove_client_from_group))
         .route("/api/v1/health", get(health_check))
         
         .with_state(state);
@@ -230,18 +266,27 @@ async fn trigger_restart() -> Json<ConfigResponse> {
 // Dynamic Security JSON Endpoints
 // ----------------------------------------------------------------------------
 
-pub async fn get_dynsec_config() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let path = "/var/lib/mosquitto/dynamic-security.json";
+pub async fn get_dynsec_config(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let path = &state.dynsec_path;
+    
     crate::log_info(&format!("mosqops: Reading dynsec config from {}", path));
-    match std::fs::read_to_string(path) {
+    match std::fs::read_to_string(&path) {
         Ok(content) => {
             match serde_json::from_str(&content) {
-                Ok(json) => Ok(Json(json)),
-                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse JSON: {}", e)))
+                Ok(json) => {
+                    crate::log_info("mosqops: Successfully read and parsed DynSec JSON");
+                    Ok(Json(json))
+                },
+                Err(e) => {
+                    crate::log_error(&format!("mosqops: Failed to parse JSON from {}: {}", path, e));
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse JSON: {}", e)))
+                }
             }
         },
         Err(e) => {
-            crate::log_error(&format!("mosqops: Failed to read dynsec config: {}", e));
+            crate::log_error(&format!("mosqops: Failed to read dynsec config from {}: {}", path, e));
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to read dynsec config file: {}", e),
@@ -254,7 +299,7 @@ pub async fn update_dynsec_config(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
-    let path = "/var/lib/mosquitto/dynamic-security.json";
+    let path = &state.dynsec_path;
     crate::log_info(&format!("mosqops: Updating dynsec config at {}", path));
     
     let content = match serde_json::to_string_pretty(&payload) {
@@ -262,7 +307,7 @@ pub async fn update_dynsec_config(
         Err(e) => return Err((StatusCode::BAD_REQUEST, format!("Invalid JSON payload: {}", e)))
     };
     
-    match std::fs::write(path, content) {
+    match std::fs::write(&path, content) {
         Ok(_) => {
             // DynSec needs to be reloaded after file modification
             crate::log_info("mosqops: Reloading Mosquitto config to apply dynsec changes");
@@ -285,8 +330,73 @@ pub async fn update_dynsec_config(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Manual Persistence Layer
+// ----------------------------------------------------------------------------
+
+fn generate_password_hash(password: &str) -> (String, String) {
+    use rand::{RngCore, thread_rng};
+    let mut salt = [0u8; 12];
+    thread_rng().fill_bytes(&mut salt);
+    
+    let mut hash = [0u8; 64];
+    pbkdf2::<Hmac<Sha512>>(password.as_bytes(), &salt, 101, &mut hash).expect("PBKDF2 failed");
+    
+    (
+        BASE64.encode(salt),
+        BASE64.encode(hash)
+    )
+}
+
+async fn sync_dynsec<F>(state: Arc<ApiState>, mutator: F) 
+where F: FnOnce(&mut Value)
+{
+    let _lock = state.dynsec_lock.lock().await;
+    
+    let content = match fs::read_to_string(&state.dynsec_path) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Manual sync failed to read DynSec JSON: {}", e));
+            return;
+        }
+    };
+    
+    let mut config: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Manual sync failed to parse DynSec JSON: {}", e));
+            return;
+        }
+    };
+    
+    mutator(&mut config);
+    
+    // Pretty print matching Mosquitto's internal format
+    let new_content = match serde_json::to_string_pretty(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Manual sync failed to serialize DynSec JSON: {}", e));
+            return;
+        }
+    };
+    
+    // Atomic write
+    let tmp_path = format!("{}.tmp", state.dynsec_path);
+    if let Err(e) = fs::write(&tmp_path, new_content) {
+        crate::log_error(&format!("mosqops: Manual sync failed to write temp file: {}", e));
+        return;
+    }
+    
+    if let Err(e) = fs::rename(&tmp_path, &state.dynsec_path) {
+        crate::log_error(&format!("mosqops: Manual sync failed to rename temp file: {}", e));
+        let _ = fs::remove_file(&tmp_path);
+    } else {
+        crate::log_info(&format!("mosqops: Manual sync persisted changes to {}", state.dynsec_path));
+    }
+}
+
 pub async fn reset_dynsec_config(State(state): State<Arc<ApiState>>) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
-    let path = "/var/lib/mosquitto/dynamic-security.json";
+    let path = &state.dynsec_path;
     crate::log_info(&format!("mosqops: Resetting dynsec config at {} from safe backup", path));
     
     let working_path = format!("{}.working", path);
@@ -336,18 +446,49 @@ pub async fn create_client(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<ClientCreate>,
 ) -> Result<Json<ClientResponse>, (StatusCode, String)> {
-    
-    // 1. Create client
+    let username = payload.username.clone();
+    let password = payload.password.clone();
+
+    // 1. MQTT Command for real-time update
     let create_args = json!({
-        "username": payload.username,
-        "password": payload.password,
+        "username": username,
+        "password": password,
     });
     
     match state.dynsec.execute_command("createClient", create_args).await {
         Ok(_) => {
+            // 2. Manual persistence for pod restart reliability
+            let state_clone = state.clone();
+            let username_clone = username.clone();
+            let password_clone = password.clone();
+            
+            tokio::spawn(async move {
+                let (salt, hash) = generate_password_hash(&password_clone);
+                sync_dynsec(state_clone, move |cfg| {
+                    let clients = cfg.as_object_mut().and_then(|o| o.get_mut("clients")).and_then(|c| c.as_array_mut());
+                    if let Some(clients) = clients {
+                        let entry = json!({
+                            "username": username_clone,
+                            "textname": "",
+                            "roles": [],
+                            "groups": [],
+                            "password": hash,
+                            "salt": salt,
+                            "iterations": 101,
+                        });
+                        
+                        if let Some(pos) = clients.iter().position(|c| c.get("username").and_then(|u| u.as_str()) == Some(&username_clone)) {
+                            clients[pos] = entry;
+                        } else {
+                            clients.push(entry);
+                        }
+                    }
+                }).await;
+            });
+
             Ok(Json(ClientResponse {
-                username: payload.username,
-                message: "Client created and password set successfully".into(),
+                username: username,
+                message: "Client created and password set successfully (manual sync triggered)".into(),
                 success: true,
             }))
         },
@@ -365,16 +506,38 @@ pub async fn set_client_password(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<ClientCreate>,
 ) -> Result<Json<ClientResponse>, (StatusCode, String)> {
+    let password = payload.password.clone();
     let set_args = json!({
         "username": username,
-        "password": payload.password,
+        "password": password.clone(),
     });
     
     match state.dynsec.execute_command("setClientPassword", set_args).await {
         Ok(_) => {
+            let state_clone = state.clone();
+            let username_clone = username.clone();
+            let password_clone = password.clone();
+
+            tokio::spawn(async move {
+                let (salt, hash) = generate_password_hash(&password_clone);
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(client) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("clients"))
+                        .and_then(|c| c.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|c| c.get("username").and_then(|u| u.as_str()) == Some(&username_clone))) {
+                        
+                        if let Some(obj) = client.as_object_mut() {
+                            obj.insert("password".to_string(), json!(hash));
+                            obj.insert("salt".to_string(), json!(salt));
+                            obj.insert("iterations".to_string(), json!(101));
+                        }
+                    }
+                }).await;
+            });
+
             Ok(Json(ClientResponse {
                 username,
-                message: "Password set successfully".into(),
+                message: "Password set successfully (manual sync triggered)".into(),
                 success: true,
             }))
         },
@@ -464,7 +627,26 @@ pub async fn remove_client(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.dynsec.execute_command("deleteClient", json!({"username": username})).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Client {} removed successfully", username)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let username_clone = username.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(clients) = cfg.as_object_mut().and_then(|o| o.get_mut("clients")).and_then(|c| c.as_array_mut()) {
+                        clients.retain(|c| c.get("username").and_then(|u| u.as_str()) != Some(&username_clone));
+                    }
+                    if let Some(groups) = cfg.as_object_mut().and_then(|o| o.get_mut("groups")).and_then(|g| g.as_array_mut()) {
+                        for group in groups {
+                            if let Some(members) = group.get_mut("clients").and_then(|c| c.as_array_mut()) {
+                                members.retain(|m| m.get("username").and_then(|u| u.as_str()) != Some(&username_clone));
+                            }
+                        }
+                    }
+                }).await;
+            });
+
+            Ok(Json(json!({"message": format!("Client {} removed successfully (manual sync triggered)", username)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, format!("Failed to remove client: {}", e)))
     }
 }
@@ -481,12 +663,37 @@ pub async fn add_client_role(
     Json(payload): Json<RoleAssignment>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let prio = payload.priority.unwrap_or(1);
+    let role_name = payload.role_name.clone();
+
     match state.dynsec.execute_command("addClientRole", json!({
         "username": username,
-        "rolename": payload.role_name,
+        "rolename": role_name,
         "priority": prio
     })).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Role {} assigned to client {}", payload.role_name, username)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let username_clone = username.clone();
+            let role_name_clone = role_name.clone();
+            
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(client) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("clients"))
+                        .and_then(|c| c.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|c| c.get("username").and_then(|u| u.as_str()) == Some(&username_clone))) {
+                        
+                        let roles = client.as_object_mut().and_then(|o| o.get_mut("roles")).and_then(|r| r.as_array_mut());
+                        if let Some(roles) = roles {
+                            if !roles.iter().any(|r| r.get("rolename").and_then(|n| n.as_str()) == Some(&role_name_clone)) {
+                                roles.push(json!({"rolename": role_name_clone, "priority": prio}));
+                            }
+                        }
+                    }
+                }).await;
+            });
+
+            Ok(Json(json!({"message": format!("Role {} assigned to client {} (manual sync triggered)", role_name, username)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -499,7 +706,27 @@ pub async fn remove_client_role(
         "username": username,
         "rolename": role_name,
     })).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Role {} removed from client {}", role_name, username)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let username_clone = username.clone();
+            let role_name_clone = role_name.clone();
+
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(client) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("clients"))
+                        .and_then(|c| c.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|c| c.get("username").and_then(|u| u.as_str()) == Some(&username_clone))) {
+                        
+                        if let Some(roles) = client.as_object_mut().and_then(|o| o.get_mut("roles")).and_then(|r| r.as_array_mut()) {
+                            roles.retain(|r| r.get("rolename").and_then(|n| n.as_str()) != Some(&role_name_clone));
+                        }
+                    }
+                }).await;
+            });
+
+            Ok(Json(json!({"message": format!("Role {} removed from client {} (manual sync triggered)", role_name, username)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -517,8 +744,22 @@ pub async fn create_role(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<RoleCreate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.dynsec.execute_command("createRole", json!({"rolename": payload.name})).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Role {} created successfully", payload.name)}))),
+    let role_name = payload.name.clone();
+    match state.dynsec.execute_command("createRole", json!({"rolename": role_name})).await {
+        Ok(_) => {
+            let state_clone = state.clone();
+            let role_name_clone = role_name.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(roles) = cfg.as_object_mut().and_then(|o| o.get_mut("roles")).and_then(|r| r.as_array_mut()) {
+                        if !roles.iter().any(|r| r.get("rolename").and_then(|n| n.as_str()) == Some(&role_name_clone)) {
+                            roles.push(json!({"rolename": role_name_clone, "acls": []}));
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("Role {} created successfully (manual sync triggered)", role_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -581,7 +822,32 @@ pub async fn delete_role(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.dynsec.execute_command("deleteRole", json!({"rolename": role_name})).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Role {} deleted successfully", role_name)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let role_name_clone = role_name.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(roles) = cfg.as_object_mut().and_then(|o| o.get_mut("roles")).and_then(|r| r.as_array_mut()) {
+                        roles.retain(|r| r.get("rolename").and_then(|n| n.as_str()) != Some(&role_name_clone));
+                    }
+                    if let Some(clients) = cfg.as_object_mut().and_then(|o| o.get_mut("clients")).and_then(|c| c.as_array_mut()) {
+                        for client in clients {
+                            if let Some(roles) = client.get_mut("roles").and_then(|r| r.as_array_mut()) {
+                                roles.retain(|r| r.get("rolename").and_then(|n| n.as_str()) != Some(&role_name_clone));
+                            }
+                        }
+                    }
+                    if let Some(groups) = cfg.as_object_mut().and_then(|o| o.get_mut("groups")).and_then(|g| g.as_array_mut()) {
+                        for group in groups {
+                            if let Some(roles) = group.get_mut("roles").and_then(|r| r.as_array_mut()) {
+                                roles.retain(|r| r.get("rolename").and_then(|n| n.as_str()) != Some(&role_name_clone));
+                            }
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("Role {} deleted successfully (manual sync triggered)", role_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -600,13 +866,37 @@ pub async fn add_role_acl(
     Json(payload): Json<AclRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let allow = payload.permission.to_lowercase() == "allow";
+    let acl_type = payload.acl_type.clone();
+    let topic = payload.topic.clone();
+
     match state.dynsec.execute_command("addRoleACL", json!({
         "rolename": role_name,
-        "acltype": payload.acl_type,
-        "topic": payload.topic,
+        "acltype": acl_type,
+        "topic": topic,
         "allow": allow
     })).await {
-        Ok(_) => Ok(Json(json!({"message": format!("ACL added successfully to role {}", role_name)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let role_name_clone = role_name.clone();
+            let acl_type_clone = acl_type.clone();
+            let topic_clone = topic.clone();
+            
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(role) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("roles"))
+                        .and_then(|r| r.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|r| r.get("rolename").and_then(|n| n.as_str()) == Some(&role_name_clone))) {
+                        
+                        let acls = role.as_object_mut().and_then(|o| o.get_mut("acls")).and_then(|a| a.as_array_mut());
+                        if let Some(acls) = acls {
+                            acls.push(json!({"acltype": acl_type_clone, "topic": topic_clone, "allow": allow}));
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("ACL added successfully to role {} (manual sync triggered)", role_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -622,12 +912,35 @@ pub async fn remove_role_acl(
     axum::extract::Query(query): axum::extract::Query<RemoveAclQuery>,
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let acl_type = query.acl_type.clone();
+    let topic = query.topic.clone();
+
     match state.dynsec.execute_command("removeRoleACL", json!({
         "rolename": role_name,
-        "acltype": query.acl_type,
-        "topic": query.topic
+        "acltype": acl_type,
+        "topic": topic
     })).await {
-        Ok(_) => Ok(Json(json!({"message": format!("ACL removed from role {} successfully", role_name)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let role_name_clone = role_name.clone();
+            let acl_type_clone = acl_type.clone();
+            let topic_clone = topic.clone();
+
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(role) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("roles"))
+                        .and_then(|r| r.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|r| r.get("rolename").and_then(|n| n.as_str()) == Some(&role_name_clone))) {
+                        
+                        if let Some(acls) = role.as_object_mut().and_then(|o| o.get_mut("acls")).and_then(|a| a.as_array_mut()) {
+                            acls.retain(|a| !(a.get("acltype").and_then(|t| t.as_str()) == Some(&acl_type_clone) && a.get("topic").and_then(|t| t.as_str()) == Some(&topic_clone)));
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("ACL removed from role {} successfully (manual sync triggered)", role_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -645,8 +958,22 @@ pub async fn create_group(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<GroupCreate>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.dynsec.execute_command("createGroup", json!({"groupname": payload.name})).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Group {} created successfully", payload.name)}))),
+    let group_name = payload.name.clone();
+    match state.dynsec.execute_command("createGroup", json!({"groupname": group_name})).await {
+        Ok(_) => {
+            let state_clone = state.clone();
+            let group_name_clone = group_name.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(groups) = cfg.as_object_mut().and_then(|o| o.get_mut("groups")).and_then(|g| g.as_array_mut()) {
+                        if !groups.iter().any(|g| g.get("groupname").and_then(|n| n.as_str()) == Some(&group_name_clone)) {
+                            groups.push(json!({"groupname": group_name_clone, "roles": [], "clients": []}));
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("Group {} created successfully (manual sync triggered)", group_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -704,7 +1031,18 @@ pub async fn delete_group(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.dynsec.execute_command("deleteGroup", json!({"groupname": group_name})).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Group {} deleted successfully", group_name)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let group_name_clone = group_name.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(groups) = cfg.as_object_mut().and_then(|o| o.get_mut("groups")).and_then(|g| g.as_array_mut()) {
+                        groups.retain(|g| g.get("groupname").and_then(|n| n.as_str()) != Some(&group_name_clone));
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("Group {} deleted successfully (manual sync triggered)", group_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -714,11 +1052,33 @@ pub async fn add_group_role(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<RoleAssignment>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let role_name = payload.role_name.clone();
     match state.dynsec.execute_command("addGroupRole", json!({
         "groupname": group_name,
-        "rolename": payload.role_name
+        "rolename": role_name
     })).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Role {} assigned to group {}", payload.role_name, group_name)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let group_name_clone = group_name.clone();
+            let role_name_clone = role_name.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(group) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("groups"))
+                        .and_then(|g| g.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|g| g.get("groupname").and_then(|n| n.as_str()) == Some(&group_name_clone))) {
+                        
+                        let roles = group.as_object_mut().and_then(|o| o.get_mut("roles")).and_then(|r| r.as_array_mut());
+                        if let Some(roles) = roles {
+                            if !roles.iter().any(|r| r.get("rolename").and_then(|n| n.as_str()) == Some(&role_name_clone)) {
+                                roles.push(json!({"rolename": role_name_clone}));
+                            }
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("Role {} assigned to group {} (manual sync triggered)", role_name, group_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -731,7 +1091,25 @@ pub async fn remove_group_role(
         "groupname": group_name,
         "rolename": role_name
     })).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Role {} removed from group {}", role_name, group_name)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let group_name_clone = group_name.clone();
+            let role_name_clone = role_name.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(group) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("groups"))
+                        .and_then(|g| g.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|g| g.get("groupname").and_then(|n| n.as_str()) == Some(&group_name_clone))) {
+                        
+                        if let Some(roles) = group.as_object_mut().and_then(|o| o.get_mut("roles")).and_then(|r| r.as_array_mut()) {
+                            roles.retain(|r| r.get("rolename").and_then(|n| n.as_str()) != Some(&role_name_clone));
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("Role {} removed from group {} (manual sync triggered)", role_name, group_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -748,12 +1126,34 @@ pub async fn add_client_to_group(
     Json(payload): Json<GroupClientAdd>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let prio = payload.priority.unwrap_or(1);
+    let username = payload.username.clone();
     match state.dynsec.execute_command("addGroupClient", json!({
         "groupname": group_name,
-        "username": payload.username,
+        "username": username,
         "priority": prio
     })).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Client {} added to group {} successfully", payload.username, group_name)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let group_name_clone = group_name.clone();
+            let username_clone = username.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(group) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("groups"))
+                        .and_then(|g| g.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|g| g.get("groupname").and_then(|n| n.as_str()) == Some(&group_name_clone))) {
+                        
+                        let clients = group.as_object_mut().and_then(|o| o.get_mut("clients")).and_then(|c| c.as_array_mut());
+                        if let Some(clients) = clients {
+                            if !clients.iter().any(|c| c.get("username").and_then(|n| n.as_str()) == Some(&username_clone)) {
+                                clients.push(json!({"username": username_clone, "priority": prio}));
+                            }
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("Client {} added to group {} successfully (manual sync triggered)", username, group_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }
@@ -766,7 +1166,25 @@ pub async fn remove_client_from_group(
         "groupname": group_name,
         "username": username
     })).await {
-        Ok(_) => Ok(Json(json!({"message": format!("Client {} removed from group {} successfully", username, group_name)}))),
+        Ok(_) => {
+            let state_clone = state.clone();
+            let group_name_clone = group_name.clone();
+            let username_clone = username.clone();
+            tokio::spawn(async move {
+                sync_dynsec(state_clone, move |cfg| {
+                    if let Some(group) = cfg.as_object_mut()
+                        .and_then(|o| o.get_mut("groups"))
+                        .and_then(|g| g.as_array_mut())
+                        .and_then(|a| a.iter_mut().find(|g| g.get("groupname").and_then(|n| n.as_str()) == Some(&group_name_clone))) {
+                        
+                        if let Some(clients) = group.as_object_mut().and_then(|o| o.get_mut("clients")).and_then(|c| c.as_array_mut()) {
+                            clients.retain(|c| c.get("username").and_then(|u| u.as_str()) != Some(&username_clone));
+                        }
+                    }
+                }).await;
+            });
+            Ok(Json(json!({"message": format!("Client {} removed from group {} successfully (manual sync triggered)", username, group_name)})))
+        },
         Err(e) => Err((StatusCode::BAD_REQUEST, e))
     }
 }

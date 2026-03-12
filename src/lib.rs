@@ -1,6 +1,5 @@
 use mosquitto_plugin::*;
 use std::ffi::{c_int, c_void};
-use std::ptr;
 use std::sync::Once;
 use tokio::runtime::Runtime;
 
@@ -39,8 +38,8 @@ pub fn log_error(msg: &str) {
 
 #[no_mangle]
 pub extern "C" fn mosquitto_plugin_version(
-    supported_version_count: c_int,
-    supported_versions: *const c_int,
+    _supported_version_count: c_int,
+    _supported_versions: *const c_int,
 ) -> c_int {
     log_info("mosqops: Checking version...");
     5 // Return Mosquitto plugin API version 5
@@ -48,20 +47,28 @@ pub extern "C" fn mosquitto_plugin_version(
 
 #[no_mangle]
 pub extern "C" fn mosquitto_plugin_init(
-    identifier: *mut mosquitto_plugin_id_t,
-    user_data: *mut *mut c_void,
+    _identifier: *mut mosquitto_plugin_id_t,
+    _user_data: *mut *mut c_void,
     opts: *mut mosquitto_opt,
     opt_count: c_int,
 ) -> c_int {
     log_info("mosqops: Initializing HTTP API plugin...");
 
+    // Install the ring crypto provider for rustls 0.23+
+    // Since we've disabled aws-lc-rs to avoid relocation errors on Alpine,
+    // we must explicitly provide a crypto provider.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let mut conf_path = String::from("mosquitto.conf"); // Default
+    let mut dynsec_path = String::from("/data/mosquitto/dynamic-security.json"); // Default fallback
 
     unsafe {
         if !opts.is_null() && opt_count > 0 {
             for i in 0..(opt_count as usize) {
                 let opt_ptr = opts as *mut u8;
-                let opt_offset = opt_ptr.add(i * std::mem::size_of::<*mut std::ffi::c_char>() * 2);
+                let opt_offset = opt_ptr.add(i * std::mem::size_of::<[*mut std::os::raw::c_char; 2]>());
                 let opt_array = &*(opt_offset as *mut [*mut std::os::raw::c_char; 2]);
                 
                 if !opt_array[0].is_null() && !opt_array[1].is_null() {
@@ -69,7 +76,8 @@ pub extern "C" fn mosquitto_plugin_init(
                     let value = std::ffi::CStr::from_ptr(opt_array[1]).to_string_lossy();
                     if key == "conf_path" {
                         conf_path = value.into_owned();
-                        break;
+                    } else if key == "config_file" {
+                        dynsec_path = value.into_owned();
                     }
                 }
             }
@@ -90,8 +98,9 @@ pub extern "C" fn mosquitto_plugin_init(
             unsafe {
                 if let Some(ref rt) = RUNTIME {
                     let conf_path_clone = conf_path.clone();
+                    let dynsec_path_clone = dynsec_path.clone();
                     rt.spawn(async move {
-                        api::start_api_server(conf_path_clone).await;
+                        api::start_api_server(conf_path_clone, dynsec_path_clone).await;
                     });
                 }
             }
@@ -105,9 +114,9 @@ pub extern "C" fn mosquitto_plugin_init(
 
 #[no_mangle]
 pub extern "C" fn mosquitto_plugin_cleanup(
-    user_data: *mut c_void,
-    opts: *mut mosquitto_opt,
-    opt_count: c_int,
+    _user_data: *mut c_void,
+    _opts: *mut mosquitto_opt,
+    _opt_count: c_int,
 ) -> c_int {
     log_info("mosqops: Cleaning up plugin...");
     

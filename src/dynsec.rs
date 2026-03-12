@@ -1,4 +1,4 @@
-use rumqttc::{AsyncClient, MqttOptions, QoS, Event, Packet, Incoming};
+use rumqttc::{AsyncClient, MqttOptions, QoS, Event, Incoming};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,7 +73,8 @@ impl DynSecCoordinator {
                         if p.topic == "$CONTROL/dynamic-security/v1/response" {
                             if let Ok(response) = serde_json::from_slice::<DynSecResponse>(&p.payload) {
                                 if let Some(responses) = response.responses {
-                                    for mut item in responses {
+                                    for item in responses {
+                                        let mut item = item; // Use it mutably only where needed if at all, but compiler suggested removing mut from loop var
                                         if let Some(corr_data) = item.correlation_data.take() {
                                             let mut map = pending_clone.lock().await;
                                             if let Some(sender) = map.remove(&corr_data) {
@@ -104,7 +105,7 @@ impl DynSecCoordinator {
         })
     }
 
-    pub async fn execute_command(&self, command_name: &str, mut params: serde_json::Value) -> Result<DynSecResponseItem, String> {
+    pub async fn execute_command(&self, command_name: &str, params: serde_json::Value) -> Result<DynSecResponseItem, String> {
         let corr_id = Uuid::new_v4().to_string();
         
         let cmd = DynSecCommand {

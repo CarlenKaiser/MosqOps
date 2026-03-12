@@ -14,7 +14,8 @@ RUN apk add --no-cache \
     wget \
     tar \
     g++ \
-    make
+    make \
+    cmake
 
 # Download Mosquitto 2.1.2 source headers (broker internals needed by the plugin crate)
 RUN MOSQUITTO_VERSION=2.1.2 && \
@@ -36,6 +37,7 @@ COPY mosquitto-plugin-local/ /build/mosquitto-plugin-local/
 # Copy plugin source
 COPY Cargo.toml /build/plugin/Cargo.toml
 COPY Cargo.lock /build/plugin/Cargo.lock
+COPY build.rs /build/plugin/build.rs
 COPY src/ /build/plugin/src/
 
 WORKDIR /build/plugin
@@ -43,23 +45,21 @@ WORKDIR /build/plugin
 # Tell bindgen where to find clang/llvm on Alpine
 ENV LIBCLANG_PATH=/usr/lib
 ENV MOSQUITTO_PLUGIN_CLANG_EXTRA_ARGS="-I/usr/include"
-# Use -C target-feature=-crt-static to ensure we don't produce a fully static binary
-# but we need -shared for the gcc step later.
-ENV RUSTFLAGS="-C target-feature=-crt-static"
+# Fixed: Back to dynamic linking to avoid proc-macro issues with crt-static
+ENV RUSTFLAGS="-C target-feature=-crt-static -L/usr/lib"
 
 RUN cargo build --release && \
-    gcc -shared -o /libmosqops.so \
-    -Wl,--whole-archive target/release/libmosqops.a -Wl,--no-whole-archive \
-    -static-libgcc \
-    -L/usr/lib -lmosquitto -lcjson && \
-    echo "Manual Alpine Build successful! Plugin size: $(du -h /libmosqops.so | cut -f1)"
+    cp target/release/libmosqops.so /libmosqops.so && \
+    echo "Cargo Build successful! Plugin size: $(du -h /libmosqops.so | cut -f1)"
 
 # -------------------------------------------
-# Stage 2: Minimal carrier image (just the .so)
+# Stage 2: Minimal carrier image (just the .so and dependencies)
 # -------------------------------------------
-FROM alpine:latest
+FROM alpine:3.18
 
 RUN mkdir -p /plugin
 COPY --from=build /libmosqops.so /plugin/mosqops.so
+# Also copy libgcc_s.so.1 which is missing in the Mosquitto image
+COPY --from=build /usr/lib/libgcc_s.so.1 /plugin/libgcc_s.so.1
 
 CMD ["echo", "MosqOps plugin carrier image — use as init container"]
