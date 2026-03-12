@@ -1,0 +1,65 @@
+# -------------------------------------------
+# Stage 1: Build MosqOps plugin for Alpine (musl)
+# -------------------------------------------
+FROM rust:alpine AS build
+
+RUN apk add --no-cache \
+    pkgconfig \
+    mosquitto-dev \
+    cjson-dev \
+    clang \
+    clang-dev \
+    llvm-dev \
+    build-base \
+    wget \
+    tar \
+    g++ \
+    make
+
+# Download Mosquitto 2.1.2 source headers (broker internals needed by the plugin crate)
+RUN MOSQUITTO_VERSION=2.1.2 && \
+    wget -qO- "https://mosquitto.org/files/source/mosquitto-${MOSQUITTO_VERSION}.tar.gz" | \
+    tar xz -C /tmp && \
+    MSRC="/tmp/mosquitto-${MOSQUITTO_VERSION}" && \
+    cp -r "$MSRC/include/"* /usr/include/ && \
+    mkdir -p /usr/include/mosquitto && \
+    cp "$MSRC/src/mosquitto_broker.h" /usr/include/ 2>/dev/null || true && \
+    cp "$MSRC/src/mosquitto_broker_internal.h" /usr/include/ 2>/dev/null || true && \
+    cp "$MSRC/include/mosquitto/"*.h /usr/include/mosquitto/ 2>/dev/null || true && \
+    rm -rf /tmp/mosquitto-*
+
+WORKDIR /build
+
+# Copy the local mosquitto-plugin dependency
+COPY mosquitto-plugin-local/ /build/mosquitto-plugin-local/
+
+# Copy plugin source
+COPY Cargo.toml /build/plugin/Cargo.toml
+COPY Cargo.lock /build/plugin/Cargo.lock
+COPY src/ /build/plugin/src/
+
+WORKDIR /build/plugin
+
+# Tell bindgen where to find clang/llvm on Alpine
+ENV LIBCLANG_PATH=/usr/lib
+ENV MOSQUITTO_PLUGIN_CLANG_EXTRA_ARGS="-I/usr/include"
+# Use -C target-feature=-crt-static to ensure we don't produce a fully static binary
+# but we need -shared for the gcc step later.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+RUN cargo build --release && \
+    gcc -shared -o /libmosqops.so \
+    -Wl,--whole-archive target/release/libmosqops.a -Wl,--no-whole-archive \
+    -static-libgcc \
+    -L/usr/lib -lmosquitto -lcjson && \
+    echo "Manual Alpine Build successful! Plugin size: $(du -h /libmosqops.so | cut -f1)"
+
+# -------------------------------------------
+# Stage 2: Minimal carrier image (just the .so)
+# -------------------------------------------
+FROM alpine:latest
+
+RUN mkdir -p /plugin
+COPY --from=build /libmosqops.so /plugin/mosqops.so
+
+CMD ["echo", "MosqOps plugin carrier image — use as init container"]

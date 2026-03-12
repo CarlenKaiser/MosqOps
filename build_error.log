@@ -1,0 +1,7 @@
+error: failed to run `rustc` to learn about target-specific information
+
+Caused by:
+  process didn't exit successfully: `C:\Users\carlenkaiser\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe - --crate-name ___ --print=file-names -L native=D:\Program Files\Microsoft Visual Studio\2022\VC\Tools\MSVC\14.29.30133\lib\x64 -L native=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.19041.0\um\x64 -L native=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.19041.0\ucrt\x64 --crate-type bin --crate-type rlib --crate-type dylib --crate-type cdylib --crate-type staticlib --crate-type proc-macro --print=sysroot --print=split-debuginfo --print=crate-name --print=cfg -Wwarnings` (exit code: 1)
+  --- stderr
+  error: multiple input filenames provided (first two filenames are `-` and `Files\Microsoft`)
+

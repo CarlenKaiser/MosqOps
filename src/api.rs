@@ -44,7 +44,7 @@ pub async fn start_api_server(conf_path: String) {
         crate::log_error(&format!("mosqops: Warning - Could not create safe backup of {}: {}", conf_path, e));
     }
     
-    let dynsec_path = "/data/mosquitto/dynamic-security.json";
+    let dynsec_path = "/var/lib/mosquitto/dynamic-security.json";
     if std::path::Path::new(dynsec_path).exists() {
         if let Err(e) = std::fs::copy(dynsec_path, format!("{}.working", dynsec_path)) {
             crate::log_error(&format!("mosqops: Warning - Could not create safe backup of dynsec config: {}", e));
@@ -231,7 +231,7 @@ async fn trigger_restart() -> Json<ConfigResponse> {
 // ----------------------------------------------------------------------------
 
 pub async fn get_dynsec_config() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let path = "/data/mosquitto/dynamic-security.json";
+    let path = "/var/lib/mosquitto/dynamic-security.json";
     crate::log_info(&format!("mosqops: Reading dynsec config from {}", path));
     match std::fs::read_to_string(path) {
         Ok(content) => {
@@ -254,7 +254,7 @@ pub async fn update_dynsec_config(
     State(state): State<Arc<ApiState>>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
-    let path = "/data/mosquitto/dynamic-security.json";
+    let path = "/var/lib/mosquitto/dynamic-security.json";
     crate::log_info(&format!("mosqops: Updating dynsec config at {}", path));
     
     let content = match serde_json::to_string_pretty(&payload) {
@@ -286,7 +286,7 @@ pub async fn update_dynsec_config(
 }
 
 pub async fn reset_dynsec_config(State(state): State<Arc<ApiState>>) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
-    let path = "/data/mosquitto/dynamic-security.json";
+    let path = "/var/lib/mosquitto/dynamic-security.json";
     crate::log_info(&format!("mosqops: Resetting dynsec config at {} from safe backup", path));
     
     let working_path = format!("{}.working", path);
