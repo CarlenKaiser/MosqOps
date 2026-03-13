@@ -106,25 +106,25 @@ pub async fn start_api_server(conf_path: String, dynsec_path: String) {
         .route("/api/config/reset", post(reset_config))
         .route("/api/restart", post(trigger_restart))
         .route("/api/v1/clients", post(create_client).get(list_clients))
-        .route("/api/v1/clients/{username}", get(get_client).delete(remove_client))
-        .route("/api/v1/clients/{username}/password", axum::routing::put(set_client_password))
-        .route("/api/v1/clients/{username}/enable", axum::routing::put(enable_client))
-        .route("/api/v1/clients/{username}/disable", axum::routing::put(disable_client))
-        .route("/api/v1/clients/{username}/roles", post(add_client_role))
-        .route("/api/v1/clients/{username}/roles/{role_name}", axum::routing::delete(remove_client_role))
+        .route("/api/v1/clients/:username", get(get_client).delete(remove_client))
+        .route("/api/v1/clients/:username/password", axum::routing::put(set_client_password))
+        .route("/api/v1/clients/:username/enable", axum::routing::put(enable_client))
+        .route("/api/v1/clients/:username/disable", axum::routing::put(disable_client))
+        .route("/api/v1/clients/:username/roles", post(add_client_role))
+        .route("/api/v1/clients/:username/roles/:role_name", axum::routing::delete(remove_client_role))
         
         .route("/api/v1/roles", post(create_role).get(list_roles))
-        .route("/api/v1/roles/{role_name}", get(get_role).delete(delete_role))
-        .route("/api/v1/roles/{role_name}/acls", post(add_role_acl).delete(remove_role_acl))
+        .route("/api/v1/roles/:role_name", get(get_role).delete(delete_role))
+        .route("/api/v1/roles/:role_name/acls", post(add_role_acl).delete(remove_role_acl))
         
         .route("/api/v1/groups", post(create_group).get(list_groups))
-        .route("/api/v1/groups/{group_name}", get(get_group).delete(delete_group))
-        .route("/api/v1/groups/{group_name}/roles", post(add_group_role))
+        .route("/api/v1/groups/:group_name", get(get_group).delete(delete_group))
+        .route("/api/v1/groups/:group_name/roles", post(add_group_role))
         .route("/api/v1/config/dynsec", get(get_dynsec_config).put(update_dynsec_config))
         .route("/api/v1/config/dynsec/reset", post(reset_dynsec_config))
-        .route("/api/v1/groups/{group_name}/roles/{role_name}", axum::routing::delete(remove_group_role))
-        .route("/api/v1/groups/{group_name}/clients", post(add_client_to_group))
-        .route("/api/v1/groups/{group_name}/clients/{username}", axum::routing::delete(remove_client_from_group))
+        .route("/api/v1/groups/:group_name/roles/:role_name", axum::routing::delete(remove_group_role))
+        .route("/api/v1/groups/:group_name/clients", post(add_client_to_group))
+        .route("/api/v1/groups/:group_name/clients/:username", axum::routing::delete(remove_client_from_group))
         .route("/api/v1/logs/broker", get(get_broker_logs))
         .route("/api/v1/logs/stream", get(stream_logs))
         .route("/api/v1/health", get(health_check))
@@ -429,7 +429,7 @@ fn generate_password_hash(password: &str) -> String {
     let iterations = 101;
     pbkdf2::<Hmac<Sha512>>(password.as_bytes(), &salt, iterations, &mut hash).expect("PBKDF2 failed");
     
-    // Format: $7$ iterations $ salt $ hash
+    // Format: $7$iterations$salt$hash
     format!(
         "$7${}${}${}",
         iterations,
