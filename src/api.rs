@@ -4,8 +4,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use axum::response::sse::{Event, Sse};
-use futures_util::stream::{Stream, StreamExt};
+use axum::response::Sse;
+use axum::response::sse::Event;
+use futures_util::stream::{BoxStream, Stream, StreamExt};
 use std::convert::Infallible;
 use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -311,7 +312,7 @@ pub async fn get_broker_logs(
 
 pub async fn stream_logs(
     Query(params): Query<LogParams>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Sse<BoxStream<'static, Result<Event, Infallible>>> {
     let backfill = params.backfill.unwrap_or(200);
     let log_path = "/var/log/mosquitto/mosquitto.log";
 
@@ -328,7 +329,7 @@ pub async fn stream_logs(
         Err(e) => {
             crate::log_error(&format!("mosqops: Failed to spawn tail for streaming: {}", e));
             // Return an empty stream if tail fails to start
-            return Sse::new(futures_util::stream::empty())
+            return Sse::new(futures_util::stream::empty().boxed())
                 .keep_alive(axum::response::sse::KeepAlive::default());
         }
     };
@@ -341,7 +342,8 @@ pub async fn stream_logs(
         .map(|line| {
             let data = line.unwrap_or_else(|e| format!("[Stream Error: {}]", e));
             Ok(Event::default().data(data))
-        });
+        })
+        .boxed();
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }

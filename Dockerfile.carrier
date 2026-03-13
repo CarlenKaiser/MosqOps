@@ -45,8 +45,7 @@ WORKDIR /build/plugin
 # Tell bindgen where to find clang/llvm on Alpine
 ENV LIBCLANG_PATH=/usr/lib
 ENV MOSQUITTO_PLUGIN_CLANG_EXTRA_ARGS="-I/usr/include"
-# Fixed: Back to dynamic linking to avoid proc-macro issues with crt-static
-ENV RUSTFLAGS="-C target-feature=-crt-static -L/usr/lib"
+ENV RUSTFLAGS="-C target-feature=-crt-static"
 
 RUN cargo build --release && \
     cp target/release/libmosqops.so /libmosqops.so && \
