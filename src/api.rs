@@ -4,6 +4,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use axum::response::sse::{Event, Sse};
+use futures_util::stream::{Stream, StreamExt};
+use std::convert::Infallible;
+use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use axum::extract::Query;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -118,6 +124,8 @@ pub async fn start_api_server(conf_path: String, dynsec_path: String) {
         .route("/api/v1/groups/{group_name}/roles/{role_name}", axum::routing::delete(remove_group_role))
         .route("/api/v1/groups/{group_name}/clients", post(add_client_to_group))
         .route("/api/v1/groups/{group_name}/clients/{username}", axum::routing::delete(remove_client_from_group))
+        .route("/api/v1/logs/broker", get(get_broker_logs))
+        .route("/api/v1/logs/stream", get(stream_logs))
         .route("/api/v1/health", get(health_check))
         
         .with_state(state);
@@ -263,6 +271,82 @@ async fn trigger_restart() -> Json<ConfigResponse> {
 }
 
 // ----------------------------------------------------------------------------
+// Log Endpoints
+// ----------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct LogParams {
+    pub lines: Option<usize>,
+    pub backfill: Option<usize>,
+}
+
+pub async fn get_broker_logs(
+    Query(params): Query<LogParams>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let lines = params.lines.unwrap_or(100);
+    // Path fixed for production deployment
+    let log_path = "/var/log/mosquitto/mosquitto.log";
+    
+    let output = Command::new("tail")
+        .arg("-n")
+        .arg(lines.to_string())
+        .arg(log_path)
+        .output()
+        .await;
+        
+    match output {
+        Ok(out) => {
+            let logs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect();
+            Ok(Json(json!({ "logs": logs })))
+        },
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Failed to read logs: {}", e));
+            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read logs: {}", e)))
+        }
+    }
+}
+
+pub async fn stream_logs(
+    Query(params): Query<LogParams>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let backfill = params.backfill.unwrap_or(200);
+    let log_path = "/var/log/mosquitto/mosquitto.log";
+
+    crate::log_info(&format!("mosqops: Starting log stream with backfill={}", backfill));
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+       .arg(format!("tail -n {} -F {} | grep --line-buffered -v '\\$SYS'", backfill, log_path))
+       .stdout(std::process::Stdio::piped())
+       .stderr(std::process::Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::log_error(&format!("mosqops: Failed to spawn tail for streaming: {}", e));
+            // Return an empty stream if tail fails to start
+            return Sse::new(futures_util::stream::empty())
+                .keep_alive(axum::response::sse::KeepAlive::default());
+        }
+    };
+
+    let stdout = child.stdout.take().unwrap();
+    let reader = BufReader::new(stdout);
+    let lines = reader.lines();
+
+    let stream = tokio_stream::wrappers::LinesStream::new(lines)
+        .map(|line| {
+            let data = line.unwrap_or_else(|e| format!("[Stream Error: {}]", e));
+            Ok(Event::default().data(data))
+        });
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+// ----------------------------------------------------------------------------
 // Dynamic Security JSON Endpoints
 // ----------------------------------------------------------------------------
 
@@ -334,15 +418,19 @@ pub async fn update_dynsec_config(
 // Manual Persistence Layer
 // ----------------------------------------------------------------------------
 
-fn generate_password_hash(password: &str) -> (String, String) {
+fn generate_password_hash(password: &str) -> String {
     use rand::{RngCore, thread_rng};
     let mut salt = [0u8; 12];
     thread_rng().fill_bytes(&mut salt);
     
     let mut hash = [0u8; 64];
-    pbkdf2::<Hmac<Sha512>>(password.as_bytes(), &salt, 101, &mut hash).expect("PBKDF2 failed");
+    let iterations = 101;
+    pbkdf2::<Hmac<Sha512>>(password.as_bytes(), &salt, iterations, &mut hash).expect("PBKDF2 failed");
     
-    (
+    // Format: $7$ iterations $ salt $ hash
+    format!(
+        "$7${}${}${}",
+        iterations,
         BASE64.encode(salt),
         BASE64.encode(hash)
     )
@@ -463,18 +551,15 @@ pub async fn create_client(
             let password_clone = password.clone();
             
             tokio::spawn(async move {
-                let (salt, hash) = generate_password_hash(&password_clone);
+                let encoded_password = generate_password_hash(&password_clone);
                 sync_dynsec(state_clone, move |cfg| {
                     let clients = cfg.as_object_mut().and_then(|o| o.get_mut("clients")).and_then(|c| c.as_array_mut());
                     if let Some(clients) = clients {
                         let entry = json!({
                             "username": username_clone,
-                            "textname": "",
                             "roles": [],
                             "groups": [],
-                            "password": hash,
-                            "salt": salt,
-                            "iterations": 101,
+                            "encoded_password": encoded_password,
                         });
                         
                         if let Some(pos) = clients.iter().position(|c| c.get("username").and_then(|u| u.as_str()) == Some(&username_clone)) {
@@ -519,7 +604,7 @@ pub async fn set_client_password(
             let password_clone = password.clone();
 
             tokio::spawn(async move {
-                let (salt, hash) = generate_password_hash(&password_clone);
+                let encoded_password = generate_password_hash(&password_clone);
                 sync_dynsec(state_clone, move |cfg| {
                     if let Some(client) = cfg.as_object_mut()
                         .and_then(|o| o.get_mut("clients"))
@@ -527,9 +612,11 @@ pub async fn set_client_password(
                         .and_then(|a| a.iter_mut().find(|c| c.get("username").and_then(|u| u.as_str()) == Some(&username_clone))) {
                         
                         if let Some(obj) = client.as_object_mut() {
-                            obj.insert("password".to_string(), json!(hash));
-                            obj.insert("salt".to_string(), json!(salt));
-                            obj.insert("iterations".to_string(), json!(101));
+                            obj.insert("encoded_password".to_string(), json!(encoded_password));
+                            // Clean up old fields if they exist from previous manual syncs
+                            obj.remove("password");
+                            obj.remove("salt");
+                            obj.remove("iterations");
                         }
                     }
                 }).await;
