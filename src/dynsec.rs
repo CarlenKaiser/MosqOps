@@ -1,11 +1,11 @@
-use rumqttc::{AsyncClient, MqttOptions, QoS, Event, Incoming};
+use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot};
-use std::time::Duration;
-use uuid::Uuid;
 use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{oneshot, Mutex};
+use uuid::Uuid;
 
 #[derive(Serialize)]
 pub struct DynSecCommand {
@@ -38,7 +38,8 @@ pub struct DynSecResponse {
 
 pub struct DynSecCoordinator {
     client: AsyncClient,
-    pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Result<DynSecResponseItem, String>>>>>,
+    pending_requests:
+        Arc<Mutex<HashMap<String, oneshot::Sender<Result<DynSecResponseItem, String>>>>>,
 }
 
 impl DynSecCoordinator {
@@ -49,21 +50,29 @@ impl DynSecCoordinator {
             1883,
         );
 
-        if let (Ok(user), Ok(pass)) = (env::var("MOSQUITTO_ADMIN_USERNAME"), env::var("MOSQUITTO_ADMIN_PASSWORD")) {
+        if let (Ok(user), Ok(pass)) = (
+            env::var("MOSQUITTO_ADMIN_USERNAME"),
+            env::var("MOSQUITTO_ADMIN_PASSWORD"),
+        ) {
             mqttoptions.set_credentials(user, pass);
         }
 
         mqttoptions.set_keep_alive(Duration::from_secs(5));
 
         let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-        let pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Result<DynSecResponseItem, String>>>>> = Arc::new(Mutex::new(HashMap::new()));
-        
+        let pending_requests: Arc<
+            Mutex<HashMap<String, oneshot::Sender<Result<DynSecResponseItem, String>>>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
+
         let pending_clone = pending_requests.clone();
 
         crate::log_info("mosqops: Connecting internal DynSec MQTT coordinator...");
 
         // Subscribe immediately after getting the client handle
-        client.subscribe("$CONTROL/dynamic-security/v1/response", QoS::AtLeastOnce).await.map_err(|e| format!("Subscribe error: {:?}", e))?;
+        client
+            .subscribe("$CONTROL/dynamic-security/v1/response", QoS::AtLeastOnce)
+            .await
+            .map_err(|e| format!("Subscribe error: {:?}", e))?;
 
         // Background task for the MQTT event loop
         tokio::spawn(async move {
@@ -71,7 +80,9 @@ impl DynSecCoordinator {
                 match eventloop.poll().await {
                     Ok(Event::Incoming(Incoming::Publish(p))) => {
                         if p.topic == "$CONTROL/dynamic-security/v1/response" {
-                            if let Ok(response) = serde_json::from_slice::<DynSecResponse>(&p.payload) {
+                            if let Ok(response) =
+                                serde_json::from_slice::<DynSecResponse>(&p.payload)
+                            {
                                 if let Some(responses) = response.responses {
                                     for item in responses {
                                         let mut item = item; // Use it mutably only where needed if at all, but compiler suggested removing mut from loop var
@@ -92,7 +103,10 @@ impl DynSecCoordinator {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        crate::log_error(&format!("mosqops: Internal MQTT event loop error: {:?}", e));
+                        crate::log_error(&format!(
+                            "mosqops: Internal MQTT event loop error: {:?}",
+                            e
+                        ));
                         tokio::time::sleep(Duration::from_secs(3)).await;
                     }
                 }
@@ -105,9 +119,13 @@ impl DynSecCoordinator {
         })
     }
 
-    pub async fn execute_command(&self, command_name: &str, params: serde_json::Value) -> Result<DynSecResponseItem, String> {
+    pub async fn execute_command(
+        &self,
+        command_name: &str,
+        params: serde_json::Value,
+    ) -> Result<DynSecResponseItem, String> {
         let corr_id = Uuid::new_v4().to_string();
-        
+
         let cmd = DynSecCommand {
             command: command_name.to_string(),
             correlation_data: corr_id.clone(),
@@ -119,11 +137,22 @@ impl DynSecCoordinator {
         };
 
         let payload = serde_json::to_string(&req).map_err(|e| e.to_string())?;
-        
-        let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(corr_id.clone(), tx);
 
-        self.client.publish("$CONTROL/dynamic-security/v1", QoS::AtLeastOnce, false, payload).await.map_err(|e| e.to_string())?;
+        let (tx, rx) = oneshot::channel();
+        self.pending_requests
+            .lock()
+            .await
+            .insert(corr_id.clone(), tx);
+
+        self.client
+            .publish(
+                "$CONTROL/dynamic-security/v1",
+                QoS::AtLeastOnce,
+                false,
+                payload,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
         // Wait with a 5 second timeout
         match tokio::time::timeout(Duration::from_secs(5), rx).await {

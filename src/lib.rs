@@ -1,7 +1,7 @@
 use mosquitto_plugin::{mosquitto_evt_basic_auth, mosquitto_evt_disconnect};
-use serde::{Serialize, Deserialize};
-use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MQTTEvent {
@@ -23,7 +23,8 @@ pub struct MQTTEvent {
 }
 
 // Thread-safe, in-memory event log (capped at 100 events)
-pub static EVENT_LOG: Lazy<Arc<Mutex<Vec<MQTTEvent>>>> = Lazy::new(|| Arc::new(Mutex::new(Vec::with_capacity(100))));
+pub static EVENT_LOG: Lazy<Arc<Mutex<Vec<MQTTEvent>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(Vec::with_capacity(100))));
 
 // Helper to push event to log (capped)
 pub fn push_event(event: MQTTEvent) {
@@ -52,10 +53,7 @@ const MOSQ_LOG_ERR: std::os::raw::c_int = 0x08;
 pub fn log_info(msg: &str) {
     if let Ok(c_msg) = std::ffi::CString::new(msg) {
         unsafe {
-            mosquitto_dev::mosquitto_log_printf(
-                MOSQ_LOG_INFO,
-                c_msg.as_ptr(),
-            );
+            mosquitto_dev::mosquitto_log_printf(MOSQ_LOG_INFO, c_msg.as_ptr());
         }
     }
 }
@@ -63,10 +61,7 @@ pub fn log_info(msg: &str) {
 pub fn log_error(msg: &str) {
     if let Ok(c_msg) = std::ffi::CString::new(msg) {
         unsafe {
-            mosquitto_dev::mosquitto_log_printf(
-                MOSQ_LOG_ERR,
-                c_msg.as_ptr(),
-            );
+            mosquitto_dev::mosquitto_log_printf(MOSQ_LOG_ERR, c_msg.as_ptr());
         }
     }
 }
@@ -103,9 +98,10 @@ pub extern "C" fn mosquitto_plugin_init(
         if !opts.is_null() && opt_count > 0 {
             for i in 0..(opt_count as usize) {
                 let opt_ptr = opts as *mut u8;
-                let opt_offset = opt_ptr.add(i * std::mem::size_of::<[*mut std::os::raw::c_char; 2]>());
+                let opt_offset =
+                    opt_ptr.add(i * std::mem::size_of::<[*mut std::os::raw::c_char; 2]>());
                 let opt_array = &*(opt_offset as *mut [*mut std::os::raw::c_char; 2]);
-                
+
                 if !opt_array[0].is_null() && !opt_array[1].is_null() {
                     let key = std::ffi::CStr::from_ptr(opt_array[0]).to_string_lossy();
                     let value = std::ffi::CStr::from_ptr(opt_array[1]).to_string_lossy();
@@ -147,7 +143,7 @@ pub extern "C" fn mosquitto_plugin_init(
                 RUNTIME = Some(rt);
             }
             log_info("mosqops: Tokio runtime started.");
-            
+
             unsafe {
                 if let Some(ref rt) = RUNTIME {
                     let conf_path_clone = conf_path.clone();
@@ -167,12 +163,17 @@ pub extern "C" fn mosquitto_plugin_init(
 
 // Trampoline for client connected event (using basic_auth event)
 #[no_mangle]
-pub extern "C" fn on_client_connected_trampoline(_event: c_int, event_data: *mut c_void, _user_data: *mut c_void) -> c_int {
+pub extern "C" fn on_client_connected_trampoline(
+    _event: c_int,
+    event_data: *mut c_void,
+    _user_data: *mut c_void,
+) -> c_int {
     use mosquitto_plugin::*;
     if event_data.is_null() {
         return 0;
     }
-    let evt: &mosquitto_evt_basic_auth = unsafe { &*(event_data as *const mosquitto_evt_basic_auth) };
+    let evt: &mosquitto_evt_basic_auth =
+        unsafe { &*(event_data as *const mosquitto_evt_basic_auth) };
     let now = chrono::Utc::now().to_rfc3339();
     let client = evt.client;
     if client.is_null() {
@@ -182,15 +183,27 @@ pub extern "C" fn on_client_connected_trampoline(_event: c_int, event_data: *mut
         use mosquitto_plugin::*;
         let client_id = {
             let ptr = mosquitto_client_id(client);
-            if ptr.is_null() { None } else { Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string())
+            }
         };
         let username = {
             let ptr = mosquitto_client_username(client);
-            if ptr.is_null() { None } else { Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string())
+            }
         };
         let ip_address = {
             let ptr = mosquitto_client_address(client);
-            if ptr.is_null() { None } else { Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string())
+            }
         };
         let port = mosquitto_client_port(client) as u16;
         let protocol_level = match mosquitto_client_protocol_version(client) as i32 {
@@ -233,12 +246,17 @@ pub extern "C" fn on_client_connected_trampoline(_event: c_int, event_data: *mut
 
 // Trampoline for client disconnected event
 #[no_mangle]
-pub extern "C" fn on_client_disconnected_trampoline(_event: c_int, event_data: *mut c_void, _user_data: *mut c_void) -> c_int {
+pub extern "C" fn on_client_disconnected_trampoline(
+    _event: c_int,
+    event_data: *mut c_void,
+    _user_data: *mut c_void,
+) -> c_int {
     use mosquitto_plugin::*;
     if event_data.is_null() {
         return 0;
     }
-    let evt: &mosquitto_evt_disconnect = unsafe { &*(event_data as *const mosquitto_evt_disconnect) };
+    let evt: &mosquitto_evt_disconnect =
+        unsafe { &*(event_data as *const mosquitto_evt_disconnect) };
     let now = chrono::Utc::now().to_rfc3339();
     let client = evt.client;
     if client.is_null() {
@@ -248,15 +266,27 @@ pub extern "C" fn on_client_disconnected_trampoline(_event: c_int, event_data: *
         use mosquitto_plugin::*;
         let client_id = {
             let ptr = mosquitto_client_id(client);
-            if ptr.is_null() { None } else { Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string())
+            }
         };
         let username = {
             let ptr = mosquitto_client_username(client);
-            if ptr.is_null() { None } else { Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string())
+            }
         };
         let ip_address = {
             let ptr = mosquitto_client_address(client);
-            if ptr.is_null() { None } else { Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string())
+            }
         };
         let port = mosquitto_client_port(client) as u16;
         let protocol_level = match mosquitto_client_protocol_version(client) as i32 {
@@ -304,7 +334,7 @@ pub extern "C" fn mosquitto_plugin_cleanup(
     _opt_count: c_int,
 ) -> c_int {
     log_info("mosqops: Cleaning up plugin...");
-    
+
     // Shut down the Tokio runtime
     unsafe {
         if let Some(rt) = RUNTIME.take() {
