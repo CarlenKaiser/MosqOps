@@ -192,4 +192,4 @@ This project follows [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE).
+See [LICENSE](LICENSE) for licensing terms.
