@@ -588,12 +588,64 @@ pub async fn get_dynsec_config(
     }
 }
 
+fn wildcard_subscriptions_enabled() -> bool {
+    match std::env::var("MOSQOPS_ALLOW_WILDCARD_SUBS") {
+        Ok(v) => {
+            let normalized = v.trim().to_ascii_lowercase();
+            !(normalized == "0" || normalized == "false" || normalized == "no")
+        }
+        Err(_) => true,
+    }
+}
+
+fn enforce_wildcard_subscription_policy(config: &mut Value) {
+    if !wildcard_subscriptions_enabled() {
+        return;
+    }
+
+    let mut role_updates = 0usize;
+    let mut client_updates = 0usize;
+
+    if let Some(roles) = config.get_mut("roles").and_then(Value::as_array_mut) {
+        for role in roles {
+            if let Some(obj) = role.as_object_mut() {
+                let needs_update = !matches!(obj.get("allowwildcardsubs"), Some(Value::Bool(true)));
+                if needs_update {
+                    obj.insert("allowwildcardsubs".to_string(), Value::Bool(true));
+                    role_updates += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(clients) = config.get_mut("clients").and_then(Value::as_array_mut) {
+        for client in clients {
+            if let Some(obj) = client.as_object_mut() {
+                let needs_update = !matches!(obj.get("allowwildcardsubs"), Some(Value::Bool(true)));
+                if needs_update {
+                    obj.insert("allowwildcardsubs".to_string(), Value::Bool(true));
+                    client_updates += 1;
+                }
+            }
+        }
+    }
+
+    if role_updates > 0 || client_updates > 0 {
+        crate::log_info(&format!(
+            "mosqops: Enforced wildcard subscription policy (roles updated: {}, clients updated: {})",
+            role_updates, client_updates
+        ));
+    }
+}
+
 pub async fn update_dynsec_config(
     State(state): State<Arc<ApiState>>,
-    Json(payload): Json<serde_json::Value>,
+    Json(mut payload): Json<serde_json::Value>,
 ) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
     let path = &state.dynsec_path;
     crate::log_info(&format!("mosqops: Updating dynsec config at {}", path));
+
+    enforce_wildcard_subscription_policy(&mut payload);
     
     let content = match serde_json::to_string_pretty(&payload) {
         Ok(c) => c,
@@ -667,6 +719,7 @@ where F: FnOnce(&mut Value)
     };
     
     mutator(&mut config);
+    enforce_wildcard_subscription_policy(&mut config);
     
     // Pretty print matching Mosquitto's internal format
     let new_content = match serde_json::to_string_pretty(&config) {
