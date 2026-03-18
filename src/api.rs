@@ -22,7 +22,10 @@ pub struct ConfigResponse {
 
 #[derive(Deserialize)]
 pub struct ConfigUpdateRequest {
-    pub config_content: String,
+    // Accept either the previous `config_content` (used by API callers)
+    // or `mosquitto_conf` which contains the raw mosquitto.conf text from the UI.
+    pub config_content: Option<String>,
+    pub mosquitto_conf: Option<String>,
 }
 
 use crate::dynsec::DynSecCoordinator;
@@ -100,6 +103,8 @@ pub async fn start_api_server(conf_path: String, dynsec_path: String) {
         dynsec_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
+    // --- MQTT Events API ---
+
     let app = Router::new()
         .route("/api/status", get(get_system_status))
         .route("/api/config", get(get_config).post(update_config))
@@ -128,7 +133,6 @@ pub async fn start_api_server(conf_path: String, dynsec_path: String) {
         .route("/api/v1/logs/broker", get(get_broker_logs))
         .route("/api/v1/logs/stream", get(stream_logs))
         .route("/api/v1/health", get(health_check))
-        
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -150,9 +154,201 @@ async fn get_system_status(State(state): State<Arc<ApiState>>) -> Json<SystemSta
     })
 }
 
-async fn get_config(State(state): State<Arc<ApiState>>) -> Result<String, (StatusCode, String)> {
+fn parse_config_value(raw: &str) -> Value {
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case("true") {
+        Value::Bool(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Value::Bool(false)
+    } else if let Ok(int_value) = value.parse::<i64>() {
+        Value::Number(int_value.into())
+    } else if let Ok(float_value) = value.parse::<f64>() {
+        if let Some(number) = serde_json::Number::from_f64(float_value) {
+            Value::Number(number)
+        } else {
+            Value::String(value.to_string())
+        }
+    } else {
+        Value::String(value.to_string())
+    }
+}
+
+fn insert_or_append(target: &mut serde_json::Map<String, Value>, key: String, value: Value) {
+    match target.get_mut(&key) {
+        None => {
+            target.insert(key, value);
+        }
+        Some(existing) => {
+            if let Some(array) = existing.as_array_mut() {
+                array.push(value);
+            } else {
+                let previous = existing.take();
+                *existing = Value::Array(vec![previous, value]);
+            }
+        }
+    }
+}
+
+fn dedup_and_collapse(v: Value) -> Value {
+    match v {
+        Value::Array(arr) => {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for item in arr {
+                let key = serde_json::to_string(&item).unwrap_or_default();
+                if seen.insert(key) {
+                    out.push(item);
+                }
+            }
+            if out.len() == 1 {
+                out.into_iter().next().unwrap()
+            } else {
+                Value::Array(out)
+            }
+        }
+        other => other,
+    }
+}
+
+fn normalize_single_log(v: Value) -> Value {
+    if let Value::String(s) = v {
+        if s.starts_with("file ") {
+            let path = s[5..].to_string();
+            let mut m = serde_json::Map::new();
+            m.insert("type".to_string(), Value::String("file".to_string()));
+            m.insert("path".to_string(), Value::String(path));
+            Value::Object(m)
+        } else {
+            let mut m = serde_json::Map::new();
+            m.insert("type".to_string(), Value::String(s));
+            Value::Object(m)
+        }
+    } else {
+        v
+    }
+}
+
+fn normalize_log_dest(v: Value) -> Value {
+    match v {
+        Value::Array(arr) => Value::Array(arr.into_iter().map(normalize_single_log).collect()),
+        other => normalize_single_log(other),
+    }
+}
+
+
+async fn get_config(State(state): State<Arc<ApiState>>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match std::fs::read_to_string(&state.conf_path) {
-        Ok(content) => Ok(content),
+        Ok(content) => {
+            // Parse config file into config and listeners, matching BunkerM backend
+            let mut config = serde_json::Map::new();
+            let mut listeners = Vec::new();
+            let mut current_listener: Option<serde_json::Map<String, serde_json::Value>> = None;
+
+            for raw_line in content.lines() {
+                let line = raw_line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                if line.starts_with("listener ") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Some(listener) = current_listener.take() {
+                        listeners.push(listener);
+                    }
+                    let mut listener = serde_json::Map::new();
+                    listener.insert("port".to_string(), parts.get(1).and_then(|p| p.parse::<i64>().ok()).unwrap_or(0).into());
+                    listener.insert("bind_address".to_string(), if parts.len() > 2 { Value::String(parts[2].to_string()) } else { Value::String(String::new()) });
+                    listener.insert("per_listener_settings".to_string(), false.into());
+                    listener.insert("max_connections".to_string(), (-1).into());
+                    current_listener = Some(listener);
+                    continue;
+                }
+
+                let mut parts = line.split_whitespace();
+                let key = match parts.next() {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let value_raw = parts.collect::<Vec<&str>>().join(" ");
+                let value = parse_config_value(&value_raw);
+
+                if let Some(listener) = current_listener.as_mut() {
+                    insert_or_append(listener, key.to_string(), value);
+                } else {
+                    insert_or_append(&mut config, key.to_string(), value);
+                }
+            }
+
+            if let Some(listener) = current_listener.take() {
+                listeners.push(listener);
+            }
+
+            // Post-process: promote known global keys from listeners to top-level config,
+            // normalize log destinations, and collapse/dedupe arrays where appropriate.
+            let global_keys = vec![
+                "plugin",
+                "plugin_opt_config_file",
+                "plugin_opt_conf_path",
+                "persistence",
+                "persistence_file",
+                "persistence_location",
+            ];
+
+            for listener in &mut listeners {
+                for g in &global_keys {
+                    if let Some(v) = listener.remove(*g) {
+                        insert_or_append(&mut config, g.to_string(), v);
+                    }
+                }
+            }
+
+            // Normalize each listener map
+            for listener in &mut listeners {
+                let orig = std::mem::take(listener);
+                let mut new = serde_json::Map::new();
+                for (k, v) in orig {
+                    let v = if k == "log_dest" {
+                        normalize_log_dest(v)
+                    } else {
+                        dedup_and_collapse(v)
+                    };
+                    new.insert(k, v);
+                }
+                *listener = new;
+            }
+
+            // Normalize top-level config entries
+            let orig_conf = std::mem::take(&mut config);
+            let mut new_conf = serde_json::Map::new();
+            for (k, v) in orig_conf {
+                let v = if k == "log_dest" { normalize_log_dest(v) } else { dedup_and_collapse(v) };
+                new_conf.insert(k, v);
+            }
+            config = new_conf;
+
+            // Produce output that mirrors mosquitto.conf layout while matching
+            // BunkerM backend expectations: return `success`, a `config` object,
+            // a `listeners` array, and the raw `mosquitto_conf` string.
+            let mut root = serde_json::Map::new();
+
+            // Insert success metadata
+            root.insert("success".to_string(), Value::Bool(true));
+
+            // Top-level config object (all non-listener directives)
+            root.insert("config".to_string(), Value::Object(config));
+
+            // Insert listeners under the plural `listeners` key (preferred by BunkerM)
+            let listener_values: Vec<Value> = listeners.into_iter().map(Value::Object).collect();
+            root.insert("listeners".to_string(), Value::Array(listener_values.clone()));
+
+            // Also keep the older singular `listener` key for backward compatibility
+            root.insert("listener".to_string(), Value::Array(listener_values));
+
+            // Expose the raw mosquitto.conf content so UIs can render the exact file
+            root.insert("mosquitto_conf".to_string(), Value::String(content.clone()));
+
+            Ok(Json(Value::Object(root)))
+        },
         Err(e) => {
             crate::log_error(&format!("mosqops: Failed to read config: {}", e));
             Err((
@@ -168,10 +364,21 @@ async fn update_config(
     Json(payload): Json<ConfigUpdateRequest>,
 ) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
     crate::log_info(&format!("mosqops: Updating config at {}", state.conf_path));
-    
+
+    // Determine the raw configuration text to write. Prefer `mosquitto_conf` (raw)
+    // which the UI will send when editing the file directly. Fall back to
+    // `config_content` for backwards compatibility.
+    let raw_conf = if let Some(m) = payload.mosquitto_conf {
+        m
+    } else if let Some(c) = payload.config_content {
+        c
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "No configuration payload provided".into()));
+    };
+
     // 1. Write the new configuration to a temporary file
     let tmp_path = format!("{}.test", state.conf_path);
-    if let Err(e) = std::fs::write(&tmp_path, &payload.config_content) {
+    if let Err(e) = std::fs::write(&tmp_path, &raw_conf) {
         crate::log_error(&format!("mosqops: Failed to write temp config: {}", e));
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -320,7 +527,7 @@ pub async fn stream_logs(
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-       .arg(format!("tail -n {} -F {} | grep --line-buffered -v '\\$SYS'", backfill, log_path))
+       .arg(format!("tail -n {} -F {}", backfill, log_path))
        .stdout(std::process::Stdio::piped())
        .stderr(std::process::Stdio::null());
 
