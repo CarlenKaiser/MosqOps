@@ -1,1 +1,10 @@
 /target
+
+# Debug and build output artifacts
+*.log
+build_out*.txt
+cargo_err*.txt
+cargo_out*.txt
+cargo_verbose*.log
+*.tmp
+*.bak
