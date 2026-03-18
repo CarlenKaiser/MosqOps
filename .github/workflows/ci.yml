@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+
+jobs:
+  rust-checks:
+    runs-on: ubuntu-latest
+    env:
+      MOSQUITTO_PLUGIN_CLANG_EXTRA_ARGS: -I${{ github.workspace }}/include
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check (root)
+        run: cargo check --all-targets
+
+      - name: Cargo check (local plugin crate)
+        run: cargo check --manifest-path mosquitto-plugin-local/Cargo.toml --all-targets
