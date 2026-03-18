@@ -24,22 +24,16 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Build successful. Preparing to push to $Registry..." -ForegroundColor Green
 
-# Handle credentials
-if ($VaultName -and $SecretName) {
-    Write-Host "Fetching credentials from Azure Key Vault: $VaultName..." -ForegroundColor Cyan
-    $password = az keyvault secret show --vault-name $VaultName --name $SecretName --query value -o tsv
-    if (-not $password) {
-        Write-Host "Failed to fetch secret from Key Vault!" -ForegroundColor Red
-        exit 1
-    }
-    # Login via docker login for flexibility with tokens/SPs
-    # Assuming the registry name is the username for token-based auth or '00000000-0000-0000-0000-000000000000' for SP
-    $regName = ($Registry -replace '\.azurecr\.io$','')
-    echo $password | docker login $Registry -u $regName --password-stdin
-} else {
-    Write-Host "Logging into ACR via az acr login..." -ForegroundColor Cyan
-    az acr login --name ($Registry -replace '\.azurecr\.io$','')
+
+# Always use az acr login --expose-token and docker login for ACR authentication
+$acrName = ($Registry -replace '\.azurecr\.io$','')
+Write-Host "Authenticating Docker with ACR: $acrName" -ForegroundColor Cyan
+$acrToken = az acr login --name $acrName --expose-token --output tsv --query accessToken
+if (-not $acrToken) {
+    Write-Host "Failed to get ACR access token!" -ForegroundColor Red
+    exit 1
 }
+echo $acrToken | docker login $Registry --username 00000000-0000-0000-0000-000000000000 --password-stdin
 
 docker push $FullImage
 
