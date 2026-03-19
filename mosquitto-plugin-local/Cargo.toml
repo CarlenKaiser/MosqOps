@@ -31,6 +31,6 @@ crate-type = ["cdylib"]
 version = "0.2"
 
 [build-dependencies.bindgen]
-version = "0.64"
+version = "0.72"
 features = ["runtime"]
 default-features = false
