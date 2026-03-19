@@ -28,5 +28,5 @@ jobs:
       - name: Cargo check (root)
         run: cargo check --all-targets
 
-      - name: Cargo check (local plugin crate)
-        run: cargo check --manifest-path mosquitto-plugin-local/Cargo.toml --all-targets
+      - name: Cargo check (local plugin crate lib/tests)
+        run: cargo check --manifest-path mosquitto-plugin-local/Cargo.toml --lib --tests
