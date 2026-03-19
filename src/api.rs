@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::stream::{BoxStream, Stream, StreamExt};
+use futures_util::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -35,7 +35,6 @@ use pbkdf2::pbkdf2;
 use serde_json::{json, Value};
 use sha2::Sha512;
 use std::fs;
-use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct ApiState {
@@ -649,8 +648,7 @@ pub async fn stream_logs(
                 e
             ));
             // Return an empty stream if tail fails to start
-            return Sse::new(futures_util::stream::empty().boxed())
-                .keep_alive(axum::response::sse::KeepAlive::default());
+            return Sse::new(futures_util::stream::empty().boxed());
         }
     };
 
@@ -665,7 +663,7 @@ pub async fn stream_logs(
         })
         .boxed();
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(stream)
 }
 
 // ----------------------------------------------------------------------------
@@ -808,9 +806,7 @@ pub async fn update_dynsec_config(
 // ----------------------------------------------------------------------------
 
 fn generate_password_hash(password: &str) -> String {
-    use rand::{thread_rng, RngCore};
-    let mut salt = [0u8; 12];
-    thread_rng().fill_bytes(&mut salt);
+    let salt: [u8; 12] = rand::random();
 
     let mut hash = [0u8; 64];
     let iterations = 101;

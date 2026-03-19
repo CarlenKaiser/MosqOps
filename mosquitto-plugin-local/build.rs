@@ -30,7 +30,7 @@ fn main() {
         .allowlist_var("MOSQ_.*")
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks));
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
 
     // If the clang extra arguments variable is set, add the arguments
     let builder = if let Ok(args) = env::var(MOSQUITTO_PLUGIN_CLANG_EXTRA_ARGS) {

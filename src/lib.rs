@@ -1,4 +1,3 @@
-use mosquitto_plugin::{mosquitto_evt_basic_auth, mosquitto_evt_disconnect};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};

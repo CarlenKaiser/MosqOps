@@ -25,14 +25,12 @@ pub fn publish_broadcast(
     let nullptr: *const c_void = null();
     let properties: *mut mosquitto_property = std::ptr::null_mut();
 
-    // let payload: *mut c_void = std::ptr::null_mut(); // payload bytes, non-null if payload length > 0, must be heap allocated
     let payload_len = payload.len();
-    let payload: *const c_void = Box::new(payload).as_ptr() as *const c_void; // payload bytes, non-null if payload length > 0, must be heap allocated
 
     unsafe {
         let c_payload: *mut c_void =
             libc::malloc(std::mem::size_of::<u8>() * payload_len) as *mut c_void;
-        payload.copy_to(c_payload, payload_len);
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), c_payload as *mut u8, payload_len);
         /*
          * https://mosquitto.org/api2/files/mosquitto_broker-h.html#mosquitto_broker_publish
          * maybe want to switch to mosquitto_broker_publish to maintain ownership over
@@ -76,12 +74,11 @@ pub fn publish_to_client(
     let topic = bytes.as_ptr();
 
     let payload_len = payload.len();
-    let payload: *const c_void = Box::new(payload).as_ptr() as *const c_void;
 
     unsafe {
         let c_payload: *mut c_void =
             libc::malloc(std::mem::size_of::<u8>() * payload_len) as *mut c_void;
-        payload.copy_to(c_payload, payload_len);
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), c_payload as *mut u8, payload_len);
 
         let res = mosquitto_broker_publish(
             client_id as *const c_char, // client id to send to, null = all clients

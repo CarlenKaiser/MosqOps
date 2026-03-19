@@ -10,6 +10,7 @@ use std::fmt;
 
 pub mod dynlib;
 
+#[allow(unused_imports)]
 pub use dynlib::*;
 pub use libc;
 use std::net::IpAddr;
@@ -20,8 +21,6 @@ pub type MosquittoOpt<'a> = HashMap<&'a str, &'a str>;
 // parses the pointers given by mosquitto into a rust native structure
 pub fn __from_ptr_and_size<'a>(opts: *mut mosquitto_opt, count: usize) -> MosquittoOpt<'a> {
     let mut map = HashMap::new();
-    // Yep, raw pointer values
-    let optsval = opts as usize;
     for i in 0..count {
         // manually increment the pointers according to the coun value
         let opt_raw = unsafe {
