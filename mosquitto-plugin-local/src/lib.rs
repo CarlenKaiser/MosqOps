@@ -26,7 +26,8 @@ pub fn __from_ptr_and_size<'a>(opts: *mut mosquitto_opt, count: usize) -> Mosqui
         // manually increment the pointers according to the coun value
         let opt_raw = unsafe {
             let opt_ptr = opts as *mut u8;
-            let opt_offset = opt_ptr.add(i as usize * std::mem::size_of::<*mut std::ffi::c_char>() * 2);
+            let opt_offset =
+                opt_ptr.add(i as usize * std::mem::size_of::<*mut std::ffi::c_char>() * 2);
             opt_offset as *mut [*mut std::os::raw::c_char; 2]
         };
 
