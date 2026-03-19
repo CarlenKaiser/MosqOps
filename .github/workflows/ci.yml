@@ -19,8 +19,8 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Install clang
-        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Install clang and cJSON headers
+        run: sudo apt-get update && sudo apt-get install -y clang libcjson-dev
 
       - name: Format check
         run: cargo fmt --all -- --check
