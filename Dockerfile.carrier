@@ -32,7 +32,7 @@ RUN MOSQUITTO_VERSION=2.1.2 && \
 WORKDIR /build
 
 # Copy the local mosquitto-plugin dependency
-COPY mosquitto-plugin-local/ /build/mosquitto-plugin-local/
+COPY mosquitto-plugin-local/ /build/plugin/mosquitto-plugin-local/
 
 # Copy plugin source
 COPY Cargo.toml /build/plugin/Cargo.toml
