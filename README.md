@@ -172,10 +172,16 @@ curl -X POST http://localhost:8080/api/config \
 
 ## Build And Publish Helper
 
-The helper script can build and push a carrier image:
+The helper script builds and pushes a multi-arch carrier image by default (`linux/amd64,linux/arm64`):
 
 ```powershell
 .\build-carrier.ps1 -Registry <your-registry.azurecr.io> -Tag <version>
+```
+
+You can override platforms if needed:
+
+```powershell
+.\build-carrier.ps1 -Registry <your-registry.azurecr.io> -Tag <version> -Platforms linux/arm64
 ```
 
 ## Contributing
