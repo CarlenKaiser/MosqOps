@@ -3,19 +3,25 @@
 # -------------------------------------------
 FROM rust:alpine AS build
 
-RUN apk add --no-cache \
-    pkgconfig \
-    mosquitto-dev \
-    cjson-dev \
-    clang \
-    clang-dev \
-    llvm-dev \
-    build-base \
-    wget \
-    tar \
-    g++ \
-    make \
-    cmake
+RUN set -eux; \
+        for attempt in 1 2 3 4 5; do \
+            apk add --no-cache \
+                pkgconfig \
+                mosquitto-dev \
+                cjson-dev \
+                clang \
+                clang-dev \
+                llvm-dev \
+                build-base \
+                wget \
+                tar \
+                g++ \
+                make \
+                cmake && break; \
+            echo "apk install failed on attempt ${attempt}; retrying..."; \
+            apk cache clean || true; \
+            sleep 5; \
+        done
 
 # Download Mosquitto 2.1.2 source headers (broker internals needed by the plugin crate)
 RUN MOSQUITTO_VERSION=2.1.2 && \
