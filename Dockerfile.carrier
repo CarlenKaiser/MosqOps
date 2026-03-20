@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # -------------------------------------------
 # Stage 1: Build MosqOps plugin for Alpine (musl)
 # -------------------------------------------
@@ -53,7 +54,10 @@ ENV LIBCLANG_PATH=/usr/lib
 ENV MOSQUITTO_PLUGIN_CLANG_EXTRA_ARGS="-I/usr/include"
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-RUN cargo build --release && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/plugin/target \
+    cargo build --release && \
     cp target/release/libmosqops.so /libmosqops.so && \
     echo "Cargo Build successful! Plugin size: $(du -h /libmosqops.so | cut -f1)"
 

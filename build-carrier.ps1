@@ -1,19 +1,24 @@
 # Build and push the MosqOps plugin carrier image (multi-arch by default)
-# Usage: .\build-carrier.ps1 [-Registry <acr>] [-Tag <version>] [-Platforms <linux/amd64,linux/arm64>]
+# Usage: .\build-carrier.ps1 [-Registry <acr>] [-Tag <version>] [-Platforms <linux/amd64,linux/arm64>] [-CacheRef <registry/repo:tag>]
 param(
     [string]$Registry = "acriotdevcci.azurecr.io",
     [string]$Tag = "latest",
     [string]$ImageName = "mosqops-plugin",
     [string]$Platforms = "linux/amd64,linux/arm64",
-    [string]$BuilderName = "mosqops-multiarch"
+    [string]$BuilderName = "mosqops-multiarch",
+    [string]$CacheRef = ""
 )
 
 $ErrorActionPreference = "Stop"
 $FullImage = "$Registry/${ImageName}:${Tag}"
+if (-not $CacheRef) {
+    $CacheRef = "$Registry/${ImageName}:buildcache"
+}
 
 Write-Host "Building MosqOps plugin carrier image..." -ForegroundColor Cyan
 Write-Host "  Image: $FullImage" -ForegroundColor Gray
 Write-Host "  Platforms: $Platforms" -ForegroundColor Gray
+Write-Host "  CacheRef: $CacheRef" -ForegroundColor Gray
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red
@@ -42,21 +47,25 @@ if (-not $existingBuilder) {
 docker buildx inspect --bootstrap | Out-Null
 
 Write-Host "Building and pushing multi-arch image manifest..." -ForegroundColor Cyan
-docker buildx build \
-    --platform $Platforms \
-    -f Dockerfile.carrier \
-    -t $FullImage \
-    --push \
+docker buildx build `
+    --platform $Platforms `
+    -f Dockerfile.carrier `
+    -t $FullImage `
+    --cache-from type=registry,ref=$CacheRef `
+    --cache-to type=registry,ref=$CacheRef,mode=max `
+    --push `
     .
 
 if ($Tag -ne "latest") {
     $LatestImage = "$Registry/${ImageName}:latest"
     Write-Host "Also publishing latest tag as multi-arch: $LatestImage" -ForegroundColor Cyan
-    docker buildx build \
-        --platform $Platforms \
-        -f Dockerfile.carrier \
-        -t $LatestImage \
-        --push \
+    docker buildx build `
+        --platform $Platforms `
+        -f Dockerfile.carrier `
+        -t $LatestImage `
+        --cache-from type=registry,ref=$CacheRef `
+        --cache-to type=registry,ref=$CacheRef,mode=max `
+        --push `
         .
 }
 
