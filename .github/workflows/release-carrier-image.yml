@@ -35,6 +35,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
           REF_NAME: ${{ github.ref_name }}
           MANUAL_TAG: ${{ inputs.tag }}
         run: |
@@ -52,11 +53,23 @@ jobs:
           fi
 
           VERSION_STRIPPED="${VERSION_TAG#v}"
+          PUBLISH_LATEST="false"
+
+          # Mark stable semver releases/tags as latest (vX.Y.Z or X.Y.Z).
+          if [[ "${VERSION_TAG}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            PUBLISH_LATEST="true"
+          fi
+
+          # Never mark GitHub prereleases as latest.
+          if [[ "${EVENT_NAME}" == "release" && "${RELEASE_PRERELEASE}" == "true" ]]; then
+            PUBLISH_LATEST="false"
+          fi
 
           echo "owner_lc=${OWNER_LC}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
           echo "version_stripped=${VERSION_STRIPPED}" >> "$GITHUB_OUTPUT"
+          echo "publish_latest=${PUBLISH_LATEST}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
@@ -79,7 +92,7 @@ jobs:
           tags: |
             type=raw,value=${{ steps.vars.outputs.version_tag }}
             type=raw,value=${{ steps.vars.outputs.version_stripped }}
-            type=raw,value=latest
+            ${{ steps.vars.outputs.publish_latest == 'true' && 'type=raw,value=latest' || '' }}
           labels: |
             org.opencontainers.image.title=MosqOps Plugin Carrier
             org.opencontainers.image.description=Multi-arch carrier image for MosqOps plugin artifact
