@@ -175,14 +175,38 @@ curl -X POST http://localhost:8080/api/config \
 The helper script builds and pushes a multi-arch carrier image by default (`linux/amd64,linux/arm64`):
 
 ```powershell
-.\build-carrier.ps1 -Registry <your-registry.azurecr.io> -Tag <version>
+.\build-carrier.ps1 -Tag v0.1.0
+```
+
+Default destination is GHCR for this repo (`ghcr.io/carlenkaiser/mosqops-plugin`).
+
+For local shell authentication, provide a GitHub username and a token with package write permissions:
+
+```powershell
+.\build-carrier.ps1 -Tag v0.1.0 -Username <github-user> -Password <github-token>
+```
+
+To push to a different registry/repository path:
+
+```powershell
+.\build-carrier.ps1 -Registry ghcr.io -Repository <owner>/<image> -Tag v0.1.0
 ```
 
 You can override platforms if needed:
 
 ```powershell
-.\build-carrier.ps1 -Registry <your-registry.azurecr.io> -Tag <version> -Platforms linux/arm64
+.\build-carrier.ps1 -Tag v0.1.0 -Platforms linux/arm64
 ```
+
+## Automated Release Pipeline
+
+GitHub Actions workflow `.github/workflows/release-carrier-image.yml` builds and publishes the same multi-arch carrier image to GHCR on:
+
+- Release publish
+- Tag push matching `v*`
+- Manual dispatch (with a tag input)
+
+Published tags include `<tag>`, stripped semver (`v1.2.3` -> `1.2.3`), and `latest`.
 
 ## Contributing
 

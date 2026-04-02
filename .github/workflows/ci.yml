@@ -12,7 +12,7 @@ jobs:
       MOSQUITTO_PLUGIN_CLANG_EXTRA_ARGS: -I${{ github.workspace }}/include
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@stable
