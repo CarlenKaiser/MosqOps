@@ -38,14 +38,9 @@ RUN MOSQUITTO_VERSION=2.1.2 && \
 
 WORKDIR /build
 
-# Copy the local mosquitto-plugin dependency
-COPY mosquitto-plugin-local/ /build/plugin/mosquitto-plugin-local/
-
-# Copy plugin source
-COPY Cargo.toml /build/plugin/Cargo.toml
-COPY Cargo.lock /build/plugin/Cargo.lock
-COPY build.rs /build/plugin/build.rs
-COPY src/ /build/plugin/src/
+# Copy the plugin project (including local path dependency) in one shot to avoid
+# path-resolution issues across different Buildx/buildkit workers.
+COPY . /build/plugin/
 
 WORKDIR /build/plugin
 
@@ -57,6 +52,7 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/plugin/target \
+    test -f /build/plugin/mosquitto-plugin-local/Cargo.toml && \
     cargo build --release && \
     cp target/release/libmosqops.so /libmosqops.so && \
     echo "Cargo Build successful! Plugin size: $(du -h /libmosqops.so | cut -f1)"
