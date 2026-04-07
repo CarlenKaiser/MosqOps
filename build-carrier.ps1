@@ -18,7 +18,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Repository = $Repository.Trim('/').ToLowerInvariant()
-$FullImage = "$Registry/$Repository:$Tag"
+$FullImage = "$Registry/$Repository`:`$Tag"
 
 if (-not $CacheRef) {
     $CacheRef = "$Registry/$Repository:buildcache"
