@@ -1,6 +1,7 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MQTTEvent {
@@ -21,9 +22,29 @@ pub struct MQTTEvent {
     pub reason: Option<String>,
 }
 
-// Thread-safe, in-memory event log (capped at 100 events)
+// Live session entry — one per currently-connected MQTT client.
+// Keyed by client_id (MQTT spec guarantees uniqueness across the broker).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub client_id: String,
+    pub username: Option<String>,
+    pub ip_address: Option<String>,
+    pub port: Option<u16>,
+    pub protocol_level: Option<String>,
+    pub clean_session: Option<bool>,
+    pub keep_alive: Option<i32>,
+    /// RFC3339 timestamp of the most recent CONNECT we observed for this client_id.
+    pub connected_at: String,
+}
+
+// Thread-safe, in-memory event log (capped at 1000 events; audit trail only).
 pub static EVENT_LOG: Lazy<Arc<Mutex<Vec<MQTTEvent>>>> =
     Lazy::new(|| Arc::new(Mutex::new(Vec::with_capacity(100))));
+
+// Live session map — authoritative "who is connected right now" view.
+// Insert on basic_auth, remove on disconnect. Survives EVENT_LOG truncation.
+pub static SESSIONS: Lazy<Arc<RwLock<HashMap<String, SessionInfo>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 // Helper to push event to log (capped)
 pub fn push_event(event: MQTTEvent) {
@@ -31,6 +52,36 @@ pub fn push_event(event: MQTTEvent) {
     log.push(event);
     if log.len() > 1000 {
         log.remove(0);
+    }
+}
+
+/// Insert/update a live session. Called from the connect trampoline.
+pub fn upsert_session(info: SessionInfo) {
+    if let Ok(mut map) = SESSIONS.write() {
+        map.insert(info.client_id.clone(), info);
+    }
+}
+
+/// Remove a live session by client_id. Called from the disconnect trampoline.
+pub fn remove_session(client_id: &str) {
+    if let Ok(mut map) = SESSIONS.write() {
+        map.remove(client_id);
+    }
+}
+
+/// Snapshot all currently-connected sessions.
+pub fn list_sessions_snapshot() -> Vec<SessionInfo> {
+    match SESSIONS.read() {
+        Ok(map) => {
+            let mut v: Vec<SessionInfo> = map.values().cloned().collect();
+            v.sort_by(|a, b| {
+                a.username
+                    .cmp(&b.username)
+                    .then(a.client_id.cmp(&b.client_id))
+            });
+            v
+        }
+        Err(_) => Vec::new(),
     }
 }
 use mosquitto_plugin::*;
@@ -223,22 +274,36 @@ pub extern "C" fn on_client_connected_trampoline(
         };
         let event = MQTTEvent {
             id,
-            timestamp: now,
+            timestamp: now.clone(),
             event_type: "Client Connection".to_string(),
             client_id: client_id.clone(),
             details,
             status: Some("success".to_string()),
-            protocol_level,
+            protocol_level: protocol_level.clone(),
             clean_session,
             keep_alive,
-            username,
-            ip_address,
+            username: username.clone(),
+            ip_address: ip_address.clone(),
             port: Some(port),
             topic: None,
             payload: None,
             reason: None,
         };
         push_event(event);
+
+        // Update the live session map (authoritative "who is connected now").
+        if let Some(cid) = client_id.clone() {
+            upsert_session(SessionInfo {
+                client_id: cid,
+                username,
+                ip_address,
+                port: Some(port),
+                protocol_level,
+                clean_session,
+                keep_alive,
+                connected_at: now,
+            });
+        }
     }
     0
 }
@@ -322,6 +387,11 @@ pub extern "C" fn on_client_disconnected_trampoline(
             reason: Some(format!("reason: {}", evt.reason)),
         };
         push_event(event);
+
+        // Drop the live session entry for this client_id.
+        if let Some(cid) = client_id {
+            remove_session(&cid);
+        }
     }
     0
 }

@@ -186,6 +186,8 @@ pub async fn start_api_server(conf_path: String, dynsec_path: String) {
         )
         .route("/api/v1/logs/broker", get(get_broker_logs))
         .route("/api/v1/logs/stream", get(stream_logs))
+        .route("/api/v1/sessions", get(list_sessions))
+        .route("/api/v1/events", get(list_events))
         .route("/api/v1/health", get(health_check))
         .with_state(state);
 
@@ -195,6 +197,24 @@ pub async fn start_api_server(conf_path: String, dynsec_path: String) {
 
 pub async fn health_check() -> &'static str {
     "OK"
+}
+
+/// Returns the live MQTT session table — one row per currently-connected
+/// client_id. This is the authoritative source of truth for "who is connected
+/// right now" and should be consumed by UIs (BunkerM, etc.) instead of replaying
+/// the event log, which loses state across broker restarts.
+pub async fn list_sessions() -> Json<Vec<crate::SessionInfo>> {
+    Json(crate::list_sessions_snapshot())
+}
+
+/// Returns the recent connect/disconnect/auth event log (capped at 1000).
+/// Audit trail only; do NOT use to derive current connection state.
+pub async fn list_events() -> Json<Vec<crate::MQTTEvent>> {
+    let snapshot = match crate::EVENT_LOG.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => Vec::new(),
+    };
+    Json(snapshot)
 }
 
 #[derive(serde::Serialize)]
