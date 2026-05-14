@@ -91,6 +91,7 @@ use tokio::runtime::Runtime;
 
 pub mod api;
 pub mod dynsec;
+pub mod logwatch;
 
 static INIT: Once = Once::new();
 static mut RUNTIME: Option<Runtime> = None;
@@ -200,6 +201,14 @@ pub extern "C" fn mosquitto_plugin_init(
                     let dynsec_path_clone = dynsec_path.clone();
                     rt.spawn(async move {
                         api::start_api_server(conf_path_clone, dynsec_path_clone).await;
+                    });
+                    // Live-session tracker: subscribes to $SYS/broker/log/# and
+                    // rebuilds SESSIONS from broker connect/disconnect lines.
+                    // This is the authoritative source for /api/v1/sessions
+                    // because the plugin auth-event callback is consumed by
+                    // the dynamic-security plugin and never reaches us.
+                    rt.spawn(async move {
+                        logwatch::run().await;
                     });
                 }
             }

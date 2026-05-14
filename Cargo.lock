@@ -802,6 +802,7 @@ dependencies = [
  "once_cell",
  "pbkdf2",
  "rand",
+ "regex",
  "rumqttc",
  "rustls",
  "serde",
